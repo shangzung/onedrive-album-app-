@@ -403,7 +403,7 @@ async def home(request: Request):
 @app.get("/more", response_class=HTMLResponse)
 async def more_page(request: Request):
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login")
+    if not sid: return RedirectResponse("/login", status_code=303)
     
     google_connected = bool(TOKEN_STORE.get(sid, {}).get("google_access_token"))
     
@@ -462,8 +462,19 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     if not code or state != request.session.get("state"): return JSONResponse({"error": "invalid_state_or_missing_code"}, status_code=400)
     result = _msal_app().acquire_token_by_authorization_code(code=code, scopes=SCOPES, redirect_uri=REDIRECT_URI)
     if "access_token" not in result: return JSONResponse({"error": result.get("error"), "description": result.get("error_description")}, status_code=400)
-    sid = request.session.get("sid")
-    if not sid: return JSONResponse({"error": "missing_session"}, status_code=400)
+    old_sid = request.session.get("sid")
+    if not old_sid: return JSONResponse({"error": "missing_session"}, status_code=400)
+
+    # 用 Microsoft 帳號本身的固定 ID(oid/sub)取代原本隨機產生的瀏覽器 session id,
+    # 這樣同一個帳號無論用哪個瀏覽器或裝置登入，都會對應到同一份已掃描的圖庫資料，
+    # 不會因為換瀏覽器(=換了一個新的隨機 sid)就要重新掃描一次 OneDrive。
+    claims = result.get("id_token_claims") or {}
+    account_key = claims.get("oid") or claims.get("sub")
+    sid = f"ms-{account_key}" if account_key else old_sid
+    request.session["sid"] = sid
+    if sid != old_sid:
+        TOKEN_STORE.pop(old_sid, None)
+
     _store_ms_token(sid, result)
     await restore_db_from_onedrive(sid, result["access_token"])
     return RedirectResponse("/")
@@ -551,7 +562,7 @@ async def google_sync_start(request: Request, start_date: str = Form(""), end_da
     sid = request.session.get("sid")
     google_token = await get_google_token(sid)
     onedrive_token = await get_ms_token(sid)
-    if not google_token: return RedirectResponse("/google/login")
+    if not google_token: return RedirectResponse("/google/login", status_code=303)
 
     GOOGLE_IMPORT_STATUS[sid] = {"status": "importing", "count": 0, "total": "計算中..."}
     asyncio.create_task(run_google_auto_import(sid, google_token, onedrive_token, start_date, end_date))
@@ -825,10 +836,15 @@ async def run_background_scan(sid: str, token: str):
             db_upsert_photo(sid, item)
             count += 1
             SCAN_STATUS[sid]["count"] = count
+            if count % 300 == 0:
+                # 掃描過程中定期回存備份,萬一掃描中斷或換瀏覽器/裝置，也有最近的進度可以還原，
+                # 不用整個從頭重掃。
+                await backup_db_to_onedrive(sid, token)
         SCAN_STATUS[sid] = {"status": "done", "count": count}
         await backup_db_to_onedrive(sid, token)
     except Exception as e:
         SCAN_STATUS[sid] = {"status": "error", "error": str(e)}
+        await backup_db_to_onedrive(sid, token)
 
 def start_scan_if_needed(sid: str, token: str):
     if SCAN_STATUS.get(sid, {}).get("status") == "scanning": return
@@ -867,7 +883,7 @@ def find_duplicate_groups(items: list[dict], threshold: int = DEFAULT_DUP_THRESH
 @app.get("/duplicates/view", response_class=HTMLResponse)
 async def duplicates_view(request: Request, threshold: int = DEFAULT_DUP_THRESHOLD):
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login")
+    if not sid: return RedirectResponse("/login", status_code=303)
     
     groups = find_duplicate_groups(db_get_photos(sid), threshold=threshold)
     if not groups:
@@ -905,7 +921,7 @@ async def duplicates_view(request: Request, threshold: int = DEFAULT_DUP_THRESHO
 async def auto_clean_duplicates(request: Request, threshold: int = Form(DEFAULT_DUP_THRESHOLD)):
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
-    if not sid or not token: return RedirectResponse("/login")
+    if not sid or not token: return RedirectResponse("/login", status_code=303)
 
     groups = find_duplicate_groups(db_get_photos(sid), threshold=threshold)
     headers = {"Authorization": f"Bearer {token}"}
@@ -969,7 +985,7 @@ def get_cleanup_items(items: list[dict]) -> dict[str, list[dict]]:
 @app.get("/cleanup", response_class=HTMLResponse)
 async def cleanup_view(request: Request):
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login")
+    if not sid: return RedirectResponse("/login", status_code=303)
     
     items = db_get_photos(sid)
     cleanup_data = get_cleanup_items(items)
@@ -1041,7 +1057,7 @@ async def cleanup_view(request: Request):
 async def cleanup_batch_move(request: Request, ids: str = Form(...)):
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
-    if not sid or not token: return RedirectResponse("/login")
+    if not sid or not token: return RedirectResponse("/login", status_code=303)
 
     id_list = [i for i in ids.split(",") if i]
     if not id_list:
@@ -1104,7 +1120,7 @@ async def cleanup_batch_move(request: Request, ids: str = Form(...)):
 async def cleanup_skip(request: Request, ids: str = Form(...)):
     """把使用者標記為「不想刪除」的照片記起來，之後的快速清理列表不會再顯示它們。"""
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login")
+    if not sid: return RedirectResponse("/login", status_code=303)
 
     id_list = [i for i in ids.split(",") if i]
     if id_list:
@@ -1195,7 +1211,7 @@ def render_albums_html(items: list[dict]) -> str:
 @app.get("/albums", response_class=HTMLResponse)
 async def albums(request: Request):
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login")
+    if not sid: return RedirectResponse("/login", status_code=303)
     return HTMLResponse(render_albums_html(db_get_photos(sid)))
 
 # ---------------------------------------------------------------------------
@@ -1332,13 +1348,13 @@ def render_memories_html(items: list[dict]) -> str:
 @app.get("/memories", response_class=HTMLResponse)
 async def memories(request: Request):
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login")
+    if not sid: return RedirectResponse("/login", status_code=303)
     return HTMLResponse(render_memories_html(db_get_photos(sid)))
 
 @app.post("/memories/render")
 async def memories_render(request: Request):
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login")
+    if not sid: return RedirectResponse("/login", status_code=303)
     token = await get_ms_token(sid)
     form = await request.form(); ids = [i for i in str(form.get("ids", "")).split(",") if i]
     if len(ids) < 2: return JSONResponse({"error": "photos_not_enough"}, status_code=400)
@@ -1443,7 +1459,7 @@ def render_gallery_html(items: list[dict], status: dict, google_status: dict) ->
 async def gallery(request: Request):
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
-    if not sid or not token: return RedirectResponse("/login")
+    if not sid or not token: return RedirectResponse("/login", status_code=303)
     status = SCAN_STATUS.get(sid, {"status": "idle", "count": 0})
     return HTMLResponse(render_gallery_html(db_get_photos(sid), status, GOOGLE_IMPORT_STATUS.get(sid, {"status": "idle"})))
 
