@@ -1754,32 +1754,69 @@ async def api_delete_photo(request: Request, id: str = Form(...)):
 @app.get("/api/media/{item_id}/stream")
 async def api_media_stream(request: Request, item_id: str):
     """
-    影片/原檔串流：向 Graph 取 @microsoft.graph.downloadUrl 後 302 轉址。
-    瀏覽器 <video src> 可直接播放（downloadUrl 為預簽章，不需再帶 Bearer）。
+    影片串流：後端代理 OneDrive 內容，避免瀏覽器直接打 SharePoint 時的 CORS / 轉址問題。
     """
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
     if not sid or not token:
         return RedirectResponse("/login", status_code=303)
-    headers = {"Authorization": f"Bearer {token}"}
+    auth = {"Authorization": f"Bearer {token}"}
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             meta = await client.get(
-                f"{GRAPH_BASE}/me/drive/items/{item_id}?$select=id,@microsoft.graph.downloadUrl,file",
-                headers=headers,
+                f"{GRAPH_BASE}/me/drive/items/{item_id}?$select=id,name,size,@microsoft.graph.downloadUrl,file",
+                headers=auth,
             )
             if meta.status_code == 404:
                 return JSONResponse({"error": "not_found"}, status_code=404)
             meta.raise_for_status()
             data = meta.json()
             download_url = data.get("@microsoft.graph.downloadUrl")
-            if download_url:
-                return RedirectResponse(download_url, status_code=302)
-            # 沒有 downloadUrl 時退回 /content（讓瀏覽器跟著轉）
-            return RedirectResponse(
-                f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
-                status_code=302,
+            mime = (data.get("file") or {}).get("mimeType") or "video/mp4"
+            if not download_url:
+                download_url = f"{GRAPH_BASE}/me/drive/items/{item_id}/content"
+
+        up_headers = {}
+        if "graph.microsoft.com" in download_url:
+            up_headers["Authorization"] = f"Bearer {token}"
+        # 轉發 Range，讓進度條可拖
+        if request.headers.get("range"):
+            up_headers["Range"] = request.headers["range"]
+
+        # 用一次 stream 請求，把上游狀態與 body 轉給瀏覽器
+        client = httpx.AsyncClient(timeout=None, follow_redirects=True)
+        req = client.build_request("GET", download_url, headers=up_headers)
+        resp = await client.send(req, stream=True)
+        if resp.status_code not in (200, 206):
+            body = await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            return JSONResponse(
+                {"error": f"upstream {resp.status_code}", "detail": body[:300].decode("utf-8", "ignore")},
+                status_code=502,
             )
+
+        out_headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=1800"}
+        if resp.headers.get("content-length"):
+            out_headers["Content-Length"] = resp.headers["content-length"]
+        if resp.headers.get("content-range"):
+            out_headers["Content-Range"] = resp.headers["content-range"]
+        ct = resp.headers.get("content-type") or mime
+
+        async def body_iter():
+            try:
+                async for chunk in resp.aiter_bytes(64 * 1024):
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            body_iter(),
+            status_code=resp.status_code,
+            media_type=ct,
+            headers=out_headers,
+        )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=502)
 
