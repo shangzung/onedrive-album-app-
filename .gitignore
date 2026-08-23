@@ -1,0 +1,18 @@
+# 機密憑證,絕對不能上傳
+.env
+
+# 本機測試資料庫與快取,上線後會重新產生
+photos.db
+photos.db-journal
+renders/
+media_cache/
+
+# Python 常見產物
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 作業系統/編輯器產生的雜項檔案
+.DS_Store
+.vscode/
