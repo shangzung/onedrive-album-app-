@@ -993,26 +993,69 @@ BACKUP_FILENAME = "photos_backup.json"
 # 還原結果快取（給首頁顯示用，避免使用者完全不知道發生什麼事）
 RESTORE_STATUS: dict[str, dict] = {}
 
-async def backup_db_to_onedrive(sid: str, token: str | None):
+async def backup_db_to_onedrive(sid: str, token: str | None) -> bool:
+    """
+    備份到 OneDrive。
+    注意：Graph 簡單 PUT 上限約 4MB；超過時改用 upload session 分塊上傳，
+    否則會一直停在舊的 ~2000 張備份。
+    """
     if not token:
-        return
+        return False
     rows = db_get_photos(sid)
     if not rows:
-        return
-    url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        return False
+    payload = json.dumps(rows, ensure_ascii=False).encode("utf-8")
+    size = len(payload)
+    headers_auth = {"Authorization": f"Bearer {token}"}
     try:
-        # 6000+ 張備份可能較大，給足時間
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.put(
-                url,
-                headers=headers,
-                content=json.dumps(rows, ensure_ascii=False).encode("utf-8"),
-            )
-            resp.raise_for_status()
-        print(f"備份成功 sid={sid} count={len(rows)}")
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+            if size < 3_500_000:
+                # 小檔：直接 PUT
+                url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
+                resp = await client.put(
+                    url,
+                    headers={**headers_auth, "Content-Type": "application/json"},
+                    content=payload,
+                )
+                resp.raise_for_status()
+            else:
+                # 大檔：建立 upload session 後分塊上傳（每塊 3.2MB，需為 320KiB 倍數）
+                session_url = (
+                    f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/createUploadSession"
+                )
+                sess = await client.post(
+                    session_url,
+                    headers={**headers_auth, "Content-Type": "application/json"},
+                    json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+                )
+                sess.raise_for_status()
+                upload_url = sess.json()["uploadUrl"]
+                chunk_size = 320 * 1024 * 10  # 3.2 MB
+                start = 0
+                while start < size:
+                    end = min(start + chunk_size, size) - 1
+                    chunk = payload[start : end + 1]
+                    put_headers = {
+                        "Content-Length": str(len(chunk)),
+                        "Content-Range": f"bytes {start}-{end}/{size}",
+                    }
+                    for attempt in range(4):
+                        r = await client.put(upload_url, headers=put_headers, content=chunk, timeout=120)
+                        if r.status_code in (200, 201, 202):
+                            break
+                        if r.status_code == 416:
+                            # 範圍不對，重頭來
+                            break
+                        await asyncio.sleep(1 + attempt)
+                    else:
+                        raise RuntimeError(f"分塊上傳失敗 HTTP {r.status_code}: {r.text[:300]}")
+                    start = end + 1
+            save_scan_state(sid, photo_count=len(rows))
+            print(f"備份成功 sid={sid} count={len(rows)} bytes={size}")
+            return True
     except Exception as e:
-        print(f"備份 photos.db 到 OneDrive 失敗(sid={sid}): {e}")
+        print(f"備份 photos.db 到 OneDrive 失敗(sid={sid}) count={len(rows)} bytes={size}: {e}")
+        return False
 
 async def restore_db_from_onedrive(sid: str, token: str | None, force: bool = False) -> dict:
     """
