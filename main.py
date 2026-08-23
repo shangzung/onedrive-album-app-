@@ -139,18 +139,6 @@ select.apple-select, input.apple-input { width: 100%; padding: 10px 12px; border
 .photo-tile { position: relative; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 3px; background: var(--border); }
 .photo-tile img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
 .photo-badge { position: absolute; left: 4px; bottom: 4px; font-size: 12px; background: rgba(0,0,0,0.55); color: #fff; border-radius: 6px; padding: 1px 5px; line-height: 1.4; }
-.photo-tile.selectable { cursor: pointer; display: block; }
-.photo-tile.selectable img { transition: opacity .15s ease, filter .15s ease; }
-.photo-tile.selectable[data-selected="0"] img { opacity: 0.35; filter: grayscale(70%); }
-.photo-tile.selectable .tile-checkbox { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; z-index: 2; accent-color: var(--danger); }
-.tile-mark { position: absolute; top: 4px; left: 4px; z-index: 2; font-size: 11px; font-weight: 700; border-radius: 6px; padding: 2px 6px; display: none; }
-.tile-mark-del { background: rgba(255,59,48,0.85); color: #fff; }
-.tile-mark-keep { background: rgba(52,199,89,0.9); color: #fff; }
-.photo-tile.selectable[data-selected="1"] .tile-mark-del { display: block; }
-.photo-tile.selectable[data-selected="0"] .tile-mark-keep { display: block; }
-.batch-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 2px 10px; font-size: 13px; color: var(--secondary); font-weight: 600; }
-.batch-nav a { color: var(--accent); }
-.batch-nav .disabled { opacity: 0.35; }
 .group-card { margin-bottom: 14px; }
 .group-title { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
 .group-sub { color: var(--secondary); font-size: 12px; margin-bottom: 8px; }
@@ -261,42 +249,6 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
     </div>
     """
 
-def lb_img_tag_selectable(item: dict) -> str:
-    """分批清理用的可勾選相片格。預設勾選(=待搬移清理)，使用者點縮圖可切換成「保留」。"""
-    thumb = item.get("thumbnail_url") or item.get("thumbnailUrl") or ""
-    full = item.get("thumbnail_large_url") or item.get("thumbnailLargeUrl") or item.get("web_url") or item.get("webUrl") or thumb
-    name = (item.get("name") or "").replace('"', "&quot;")
-    taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
-    iid = item["id"]
-    return f"""
-    <label class="photo-tile selectable" data-selected="1">
-        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" loading="lazy" onclick="event.preventDefault(); event.stopPropagation(); this.closest('label').querySelector('.tile-checkbox').click();" />
-        <input type="checkbox" name="ids" value="{iid}" checked class="tile-checkbox" onchange="this.closest('.photo-tile').dataset.selected = this.checked ? '1' : '0'; updateBatchCount(this.closest('form'));" />
-        <div class="tile-mark tile-mark-del">🗑 清理</div>
-        <div class="tile-mark tile-mark-keep">✓ 保留</div>
-    </label>
-    """
-
-BATCH_CLEANUP_JS = """
-<script>
-function updateBatchCount(form){
-    if(!form) return;
-    var total = form.querySelectorAll('.tile-checkbox').length;
-    var checked = form.querySelectorAll('.tile-checkbox:checked').length;
-    var btn = form.querySelector('.batch-submit-btn');
-    if(btn) btn.textContent = '📦 移至「待清理資料夾」（已勾選 ' + checked + ' / ' + total + ' 張）';
-}
-function selectAllIn(form, state){
-    if(!form) return;
-    form.querySelectorAll('.tile-checkbox').forEach(function(cb){
-        cb.checked = state;
-        cb.closest('.photo-tile').dataset.selected = state ? '1' : '0';
-    });
-    updateBatchCount(form);
-}
-</script>
-"""
-
 app = FastAPI(title="我的相簿 App")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
@@ -315,7 +267,7 @@ def init_db():
             PRIMARY KEY (sid, id)
         )
     """)
-    for column, col_type in [("phash", "TEXT"), ("width", "INTEGER"), ("height", "INTEGER"), ("thumbnail_large_url", "TEXT"), ("source", "TEXT DEFAULT 'onedrive'")]:
+    for column, col_type in [("phash", "TEXT"), ("width", "INTEGER"), ("height", "INTEGER"), ("thumbnail_large_url", "TEXT"), ("source", "TEXT DEFAULT 'onedrive'"), ("cleanup_skip", "INTEGER DEFAULT 0")]:
         try:
             conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {col_type}")
         except sqlite3.OperationalError:
@@ -328,57 +280,47 @@ init_db()
 def _msal_app() -> msal.ConfidentialClientApplication:
     return msal.ConfidentialClientApplication(client_id=CLIENT_ID, client_credential=CLIENT_SECRET, authority=AUTHORITY)
 
-def _store_ms_token(request: Request, sid: str, result: dict):
+def _store_ms_token(sid: str, result: dict):
     TOKEN_STORE.setdefault(sid, {})
     TOKEN_STORE[sid]["access_token"] = result["access_token"]
     if result.get("refresh_token"):
         TOKEN_STORE[sid]["refresh_token"] = result["refresh_token"]
     expires_in = result.get("expires_in", 3600)
     TOKEN_STORE[sid]["expires_at"] = datetime.utcnow() + timedelta(seconds=int(expires_in) - 120)
-    # 重點:refresh_token 額外存進瀏覽器 session cookie。
-    # 伺服器重新部署(main.py 更新)後,記憶體內的 TOKEN_STORE 會被清空,
-    # 但瀏覽器帶著的 session cookie 不會變,靠這個就能自動換發新的 access_token,不必重新登入、也不必手動重新掃描。
-    if TOKEN_STORE[sid].get("refresh_token"):
-        request.session["ms_refresh_token"] = TOKEN_STORE[sid]["refresh_token"]
 
-def _store_google_token(request: Request, sid: str, data: dict):
+def _store_google_token(sid: str, data: dict):
     TOKEN_STORE.setdefault(sid, {})
     TOKEN_STORE[sid]["google_access_token"] = data["access_token"]
     if data.get("refresh_token"):
         TOKEN_STORE[sid]["google_refresh_token"] = data["refresh_token"]
     expires_in = data.get("expires_in", 3600)
     TOKEN_STORE[sid]["google_expires_at"] = datetime.utcnow() + timedelta(seconds=int(expires_in) - 120)
-    if TOKEN_STORE[sid].get("google_refresh_token"):
-        request.session["google_refresh_token"] = TOKEN_STORE[sid]["google_refresh_token"]
 
-async def get_ms_token(request: Request, sid: str | None) -> str | None:
-    """回傳有效的 OneDrive access_token,過期前 2 分鐘自動用 refresh_token 換新。
-    若伺服器程序重啟導致記憶體內快取遺失,會改用 session cookie 裡保存的 refresh_token 自動換新,
-    使用者不需要重新登入,照片資料庫也就不需要重新整個掃描一次。"""
-    if not sid:
+async def get_ms_token(sid: str | None) -> str | None:
+    """回傳有效的 OneDrive access_token,過期前 2 分鐘自動用 refresh_token 換新。"""
+    if not sid or sid not in TOKEN_STORE:
         return None
-    entry = TOKEN_STORE.get(sid) or {}
+    entry = TOKEN_STORE[sid]
     if entry.get("access_token") and entry.get("expires_at") and datetime.utcnow() < entry["expires_at"]:
         return entry["access_token"]
-    refresh_token = entry.get("refresh_token") or request.session.get("ms_refresh_token")
+    refresh_token = entry.get("refresh_token")
     if not refresh_token:
         return entry.get("access_token")
     result = _msal_app().acquire_token_by_refresh_token(refresh_token, scopes=SCOPES)
     if "access_token" not in result:
         TOKEN_STORE.pop(sid, None)
-        request.session.pop("ms_refresh_token", None)
         return None
-    _store_ms_token(request, sid, result)
+    _store_ms_token(sid, result)
     return result["access_token"]
 
-async def get_google_token(request: Request, sid: str | None) -> str | None:
-    """回傳有效的 Google access_token,過期前 2 分鐘自動用 refresh_token 換新(同樣會用 session cookie 內的備援 refresh_token)。"""
-    if not sid:
+async def get_google_token(sid: str | None) -> str | None:
+    """回傳有效的 Google access_token,過期前 2 分鐘自動用 refresh_token 換新。"""
+    if not sid or sid not in TOKEN_STORE:
         return None
-    entry = TOKEN_STORE.get(sid) or {}
+    entry = TOKEN_STORE[sid]
     if entry.get("google_access_token") and entry.get("google_expires_at") and datetime.utcnow() < entry["google_expires_at"]:
         return entry["google_access_token"]
-    refresh_token = entry.get("google_refresh_token") or request.session.get("google_refresh_token")
+    refresh_token = entry.get("google_refresh_token")
     if not refresh_token:
         return entry.get("google_access_token")
     async with httpx.AsyncClient(timeout=20) as client:
@@ -388,10 +330,9 @@ async def get_google_token(request: Request, sid: str | None) -> str | None:
         })
     data = resp.json()
     if "access_token" not in data:
-        TOKEN_STORE.setdefault(sid, {}).pop("google_access_token", None)
-        request.session.pop("google_refresh_token", None)
+        entry.pop("google_access_token", None)
         return None
-    _store_google_token(request, sid, data)
+    _store_google_token(sid, data)
     return data["access_token"]
 
 # ---------------------------------------------------------------------------
@@ -400,10 +341,8 @@ async def get_google_token(request: Request, sid: str | None) -> str | None:
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     sid = request.session.get("sid")
-    onedrive_token = await get_ms_token(request, sid)
-    google_token = await get_google_token(request, sid)
-    onedrive_connected = bool(onedrive_token)
-    google_connected = bool(google_token)
+    onedrive_connected = bool(sid and TOKEN_STORE.get(sid, {}).get("access_token"))
+    google_connected = bool(sid and TOKEN_STORE.get(sid, {}).get("google_access_token"))
 
     if not onedrive_connected:
         body = """
@@ -416,8 +355,6 @@ async def home(request: Request):
         """
         return HTMLResponse(page_shell("我的相簿", body, active_tab="home", show_tabbar=False))
 
-    # 伺服器重啟後本機資料庫是空的,但如果 OneDrive 上有備份,就悄悄自動還原,不必使用者手動重新掃描一次
-    await restore_db_from_onedrive(sid, onedrive_token)
     photo_count = len(db_get_photos(sid))
     
     if google_connected:
@@ -527,7 +464,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     if "access_token" not in result: return JSONResponse({"error": result.get("error"), "description": result.get("error_description")}, status_code=400)
     sid = request.session.get("sid")
     if not sid: return JSONResponse({"error": "missing_session"}, status_code=400)
-    _store_ms_token(request, sid, result)
+    _store_ms_token(sid, result)
     await restore_db_from_onedrive(sid, result["access_token"])
     return RedirectResponse("/")
 
@@ -577,13 +514,13 @@ async def google_callback(request: Request, code: str | None = None, state: str 
     
     sid = request.session.get("sid")
     if not sid: return JSONResponse({"error": "missing_session"}, status_code=400)
-    _store_google_token(request, sid, data)
+    _store_google_token(sid, data)
     return RedirectResponse("/google/sync/options")
 
 @app.get("/google/sync/options", response_class=HTMLResponse)
 async def google_sync_options(request: Request):
     sid = request.session.get("sid")
-    token = await get_google_token(request, sid)
+    token = await get_google_token(sid)
     if not token: return RedirectResponse("/google/login")
     
     current_year = datetime.now().year
@@ -612,8 +549,8 @@ async def google_sync_options(request: Request):
 @app.post("/google/sync/start")
 async def google_sync_start(request: Request, start_date: str = Form(""), end_date: str = Form("")):
     sid = request.session.get("sid")
-    google_token = await get_google_token(request, sid)
-    onedrive_token = await get_ms_token(request, sid)
+    google_token = await get_google_token(sid)
+    onedrive_token = await get_ms_token(sid)
     if not google_token: return RedirectResponse("/google/login")
 
     GOOGLE_IMPORT_STATUS[sid] = {"status": "importing", "count": 0, "total": "計算中..."}
@@ -765,8 +702,13 @@ async def fetch_media_iter(token: str, folder_path: str = "root", depth: int = 0
             data = resp.json()
             for item in data.get("value", []):
                 if "folder" in item:
-                    async for sub_item in fetch_media_iter(token, f"items/{item['id']}", depth + 1, max_depth): 
-                        yield sub_item
+                    try:
+                        async for sub_item in fetch_media_iter(token, f"items/{item['id']}", depth + 1, max_depth):
+                            yield sub_item
+                    except httpx.HTTPStatusError as e:
+                        # 該子資料夾可能已被刪除/移動(常見於 404),略過它、繼續掃描其他資料夾，
+                        # 不要讓單一資料夾的錯誤中斷整個掃描。
+                        print(f"略過子資料夾 {item.get('name')} ({item['id']}): {e}")
                     continue
                 
                 file_info = item.get("file")
@@ -895,7 +837,7 @@ def start_scan_if_needed(sid: str, token: str):
 @app.get("/scan/start")
 async def scan_start(request: Request):
     sid = request.session.get("sid")
-    token = await get_ms_token(request, sid)
+    token = await get_ms_token(sid)
     if not token: return JSONResponse({"error": "not_logged_in"}, status_code=401)
     start_scan_if_needed(sid, token)
     return RedirectResponse("/gallery")
@@ -962,7 +904,7 @@ async def duplicates_view(request: Request, threshold: int = DEFAULT_DUP_THRESHO
 @app.post("/duplicates/auto-clean")
 async def auto_clean_duplicates(request: Request, threshold: int = Form(DEFAULT_DUP_THRESHOLD)):
     sid = request.session.get("sid")
-    token = await get_ms_token(request, sid)
+    token = await get_ms_token(sid)
     if not sid or not token: return RedirectResponse("/login")
 
     groups = find_duplicate_groups(db_get_photos(sid), threshold=threshold)
@@ -1011,6 +953,7 @@ def get_cleanup_items(items: list[dict]) -> dict[str, list[dict]]:
     screenshots = []
     low_quality = []
     for it in items:
+        if it.get("cleanup_skip"): continue  # 使用者已標記「略過不刪」，不再出現
         if (it.get("mime_type") or "").startswith("video/"): continue
         if is_screenshot(it):
             screenshots.append(it)
@@ -1023,14 +966,10 @@ def get_cleanup_items(items: list[dict]) -> dict[str, list[dict]]:
             low_quality.append(it)
     return {"screenshots": screenshots, "low_quality": low_quality}
 
-CLEANUP_BATCH_SIZE = 50
-
 @app.get("/cleanup", response_class=HTMLResponse)
 async def cleanup_view(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
-    token = await get_ms_token(request, sid)
-    await restore_db_from_onedrive(sid, token)
     
     items = db_get_photos(sid)
     cleanup_data = get_cleanup_items(items)
@@ -1046,54 +985,32 @@ async def cleanup_view(request: Request):
     grouped_screenshots = group_by_month(cleanup_data["screenshots"])
     grouped_low_quality = group_by_month(cleanup_data["low_quality"])
     
-    qp = dict(request.query_params)
-
-    def build_month_sections(groups_dict, icon, title_prefix, kind):
+    def build_month_sections(groups_dict, icon, title_prefix):
         html = ""
-        month_keys = sorted(groups_dict.keys(), reverse=True)
-        for group_idx, month_key in enumerate(month_keys):
+        for month_key in sorted(groups_dict.keys(), reverse=True):
             group_items = groups_dict[month_key]
-            total = len(group_items)
-            total_pages = max(1, (total + CLEANUP_BATCH_SIZE - 1) // CLEANUP_BATCH_SIZE)
-            page_param = f"pg_{kind}_{group_idx}"
-            try:
-                page = int(qp.get(page_param, "0"))
-            except ValueError:
-                page = 0
-            page = max(0, min(page, total_pages - 1))
-            start = page * CLEANUP_BATCH_SIZE
-            batch_items = group_items[start:start + CLEANUP_BATCH_SIZE]
-
-            def page_url(target_page: int) -> str:
-                params = dict(qp)
-                params[page_param] = str(target_page)
-                return "/cleanup?" + urlencode(params)
-
-            prev_html = (f'<a href="{page_url(page - 1)}">‹ 上一批</a>' if page > 0
-                         else '<span class="disabled">‹ 上一批</span>')
-            next_html = (f'<a href="{page_url(page + 1)}">下一批 ›</a>' if page < total_pages - 1
-                         else '<span class="disabled">下一批 ›</span>')
-
-            thumbs = "".join(lb_img_tag_selectable(it) for it in batch_items)
-            form_id = f"cleanup_form_{kind}_{group_idx}_{page}"
-            batch_count = len(batch_items)
-
+            thumbs = "".join(lb_img_tag(it) for it in group_items)
+            ids_str = ",".join(it["id"] for it in group_items)
+            
             html += f"""
             <div class="card group-card">
-                <div class="group-title">{icon} {title_prefix} - {month_key}（共 {total} 張，第 {page + 1}/{total_pages} 批）</div>
-                <div class="group-sub" style="color: var(--warning); font-weight: bold;">預設全選為待清理，點照片可切換成「保留」👇</div>
-                <div class="batch-nav">{prev_html}<span>本批 {batch_count} 張</span>{next_html}</div>
-                <form id="{form_id}" action="/cleanup/batch-move" method="post" onsubmit="return confirm('確定要將本批已勾選的照片，移至 OneDrive 的「待清理資料夾」嗎？（標記保留的不會被搬移）');">
-                    <input type="hidden" name="redirect_to" value="{page_url(page)}" />
-                    <div class="photo-grid" style="margin-bottom: 12px;">{thumbs}</div>
-                    <div class="btn-row">
-                        <button type="button" class="btn-secondary" onclick="selectAllIn(document.getElementById('{form_id}'), true)">全選（本批）</button>
-                        <button type="button" class="btn-secondary" onclick="selectAllIn(document.getElementById('{form_id}'), false)">全部保留（本批）</button>
-                    </div>
-                    <button type="submit" class="btn-primary batch-submit-btn" style="background: var(--warning); color: #000; margin-top: 4px;">
-                        📦 移至「待清理資料夾」（已勾選 {batch_count} / {batch_count} 張）
-                    </button>
-                </form>
+                <div class="group-title">{icon} {title_prefix} - {month_key} (共 {len(group_items)} 張)</div>
+                <div class="group-sub" style="color: var(--warning); font-weight: bold;">向下滑動確認是否全為廢圖 👇</div>
+                <div class="photo-grid" style="margin-bottom: 12px;">{thumbs}</div>
+                <div class="btn-row">
+                    <form action="/cleanup/batch-move" method="post" style="flex:1;" onsubmit="return confirm('確定要將 {month_key} 的這 {len(group_items)} 張照片，移至 OneDrive 的「待清理資料夾」嗎？');">
+                        <input type="hidden" name="ids" value="{ids_str}" />
+                        <button type="submit" class="btn-primary" style="background: var(--warning); color: #000; margin-top: 4px;">
+                            📦 移至「待清理資料夾」
+                        </button>
+                    </form>
+                    <form action="/cleanup/skip" method="post" style="flex:1;">
+                        <input type="hidden" name="ids" value="{ids_str}" />
+                        <button type="submit" class="btn-secondary" style="margin-top: 4px;">
+                            ✅ 略過不刪(不再出現)
+                        </button>
+                    </form>
+                </div>
             </div>
             """
         return html
@@ -1102,9 +1019,8 @@ async def cleanup_view(request: Request):
     <div class="card banner-success">
         <h3 style="margin:0 0 8px 0;">🛡️ 啟用安全清理模式</h3>
         <p class="secondary" style="margin:0;">
-            <b>1. 分批預覽：</b>每批最多 {CLEANUP_BATCH_SIZE} 張，可上下切換瀏覽，保證能看完全部照片不怕遺漏。<br>
-            <b>2. 預設全選：</b>本批照片預設全部標記為「待清理」，點一下照片就能改成「保留」，只有保留以外的才會被搬移。<br>
-            <b>3. 安全緩衝區：</b>照片不會被刪除，而是移至 OneDrive 的 <b>「我的相簿_待清理垃圾桶」</b> 資料夾。確認沒問題後，再自行去 OneDrive 清空即可。
+            <b>1. 分批預覽：</b>每次只處理單個月份，保證能看完全部照片不怕遺漏。<br>
+            <b>2. 安全緩衝區：</b>照片不會被刪除，而是移至 OneDrive 的 <b>「我的相簿_待清理垃圾桶」</b> 資料夾。確認沒問題後，再自行去 OneDrive 清空即可。
         </p>
     </div>
     """
@@ -1114,38 +1030,22 @@ async def cleanup_view(request: Request):
     else:
         if cleanup_data["screenshots"]:
             body += f"""<div class="section-title">螢幕截圖分批清理</div>"""
-            body += build_month_sections(grouped_screenshots, "📱", "截圖", "screenshots")
+            body += build_month_sections(grouped_screenshots, "📱", "截圖")
         if cleanup_data["low_quality"]:
             body += f"""<div class="section-title">低畫質小檔案分批清理</div>"""
-            body += build_month_sections(grouped_low_quality, "🗑️", "小檔案", "lowquality")
-        body += BATCH_CLEANUP_JS
+            body += build_month_sections(grouped_low_quality, "🗑️", "小檔案")
             
     return HTMLResponse(page_shell("安全快速清理", body, active_tab="more", back_href="/more"))
 
-def _safe_cleanup_redirect(redirect_to: str | None) -> str:
-    if redirect_to and redirect_to.startswith("/cleanup"):
-        return redirect_to
-    return "/cleanup"
-
 @app.post("/cleanup/batch-move")
-async def cleanup_batch_move(request: Request):
+async def cleanup_batch_move(request: Request, ids: str = Form(...)):
     sid = request.session.get("sid")
-    token = await get_ms_token(request, sid)
+    token = await get_ms_token(sid)
     if not sid or not token: return RedirectResponse("/login")
 
-    form = await request.form()
-    # 勾選框皆為 name="ids" 的多個欄位(未勾選=保留、不會出現在表單中)；
-    # 仍相容舊版可能傳來的單一逗號字串。
-    raw_ids = form.getlist("ids")
-    id_list: list[str] = []
-    for raw in raw_ids:
-        raw = str(raw)
-        id_list.extend([i for i in raw.split(",") if i]) if "," in raw else id_list.append(raw)
-    id_list = [i for i in id_list if i]
-    dest = _safe_cleanup_redirect(str(form.get("redirect_to", "")))
-
+    id_list = [i for i in ids.split(",") if i]
     if not id_list:
-        return RedirectResponse(dest, status_code=303)
+        return RedirectResponse("/cleanup", status_code=303)
     
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
@@ -1198,7 +1098,25 @@ async def cleanup_batch_move(request: Request):
             await asyncio.sleep(0.3)
 
     await backup_db_to_onedrive(sid, token)
-    return RedirectResponse(dest, status_code=303)
+    return RedirectResponse("/cleanup", status_code=303)
+
+@app.post("/cleanup/skip")
+async def cleanup_skip(request: Request, ids: str = Form(...)):
+    """把使用者標記為「不想刪除」的照片記起來，之後的快速清理列表不會再顯示它們。"""
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login")
+
+    id_list = [i for i in ids.split(",") if i]
+    if id_list:
+        conn = sqlite3.connect(DB_PATH)
+        conn.executemany(
+            "UPDATE photos SET cleanup_skip = 1 WHERE sid = ? AND id = ?",
+            [(sid, d_id) for d_id in id_list],
+        )
+        conn.commit()
+        conn.close()
+
+    return RedirectResponse("/cleanup", status_code=303)
 
 # ---------------------------------------------------------------------------
 # 自動分類
@@ -1278,8 +1196,6 @@ def render_albums_html(items: list[dict]) -> str:
 async def albums(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
-    token = await get_ms_token(request, sid)
-    await restore_db_from_onedrive(sid, token)
     return HTMLResponse(render_albums_html(db_get_photos(sid)))
 
 # ---------------------------------------------------------------------------
@@ -1417,15 +1333,13 @@ def render_memories_html(items: list[dict]) -> str:
 async def memories(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
-    token = await get_ms_token(request, sid)
-    await restore_db_from_onedrive(sid, token)
     return HTMLResponse(render_memories_html(db_get_photos(sid)))
 
 @app.post("/memories/render")
 async def memories_render(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
-    token = await get_ms_token(request, sid)
+    token = await get_ms_token(sid)
     form = await request.form(); ids = [i for i in str(form.get("ids", "")).split(",") if i]
     if len(ids) < 2: return JSONResponse({"error": "photos_not_enough"}, status_code=400)
     all_photos = {p["id"]: p for p in db_get_photos(sid)}; items = [all_photos[i] for i in ids if i in all_photos]
@@ -1496,9 +1410,7 @@ def render_gallery_html(items: list[dict], status: dict, google_status: dict) ->
         banners += f"""<div class="card banner-warning">正在背景整理你的 OneDrive,目前已掃到 {scanned_count} 張……</div>"""
     elif scan_state == "error": 
         banners += f"""<div class="card banner-error">OneDrive 掃描時發生錯誤:{status.get("error")}</div>"""
-    elif scan_state == "idle" and not items:
-        # 只有真的完全沒有照片資料時才提示要開始掃描；
-        # 若已有資料(例如伺服器重啟後自動從 OneDrive 備份還原回來),不要再誤導使用者以為需要重新掃描一次。
+    elif scan_state == "idle": 
         banners += """<div class="card banner-info">尚未開始整理 OneDrive。<a class="pill-link" href="/scan/start">開始掃描</a></div>"""
 
     if google_state == "importing": 
@@ -1530,16 +1442,15 @@ def render_gallery_html(items: list[dict], status: dict, google_status: dict) ->
 @app.get("/gallery", response_class=HTMLResponse)
 async def gallery(request: Request):
     sid = request.session.get("sid")
-    token = await get_ms_token(request, sid)
+    token = await get_ms_token(sid)
     if not sid or not token: return RedirectResponse("/login")
-    await restore_db_from_onedrive(sid, token)
     status = SCAN_STATUS.get(sid, {"status": "idle", "count": 0})
     return HTMLResponse(render_gallery_html(db_get_photos(sid), status, GOOGLE_IMPORT_STATUS.get(sid, {"status": "idle"})))
 
 @app.get("/photos")
 async def photos(request: Request, max_depth: int = 6):
     sid = request.session.get("sid")
-    token = await get_ms_token(request, sid)
+    token = await get_ms_token(sid)
     if not token: return JSONResponse({"error": "not_logged_in", "hint": "先前往 /login"}, status_code=401)
     try: return {"count": len(items := await fetch_all_media(token, max_depth=max_depth)), "items": items}
     except httpx.HTTPStatusError as e: return JSONResponse({"error": "graph_api_error", "detail": e.response.text}, status_code=e.response.status_code)
