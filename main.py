@@ -139,6 +139,18 @@ select.apple-select, input.apple-input { width: 100%; padding: 10px 12px; border
 .photo-tile { position: relative; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 3px; background: var(--border); }
 .photo-tile img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
 .photo-badge { position: absolute; left: 4px; bottom: 4px; font-size: 12px; background: rgba(0,0,0,0.55); color: #fff; border-radius: 6px; padding: 1px 5px; line-height: 1.4; }
+.photo-tile.selectable { cursor: pointer; display: block; }
+.photo-tile.selectable img { transition: opacity .15s ease, filter .15s ease; }
+.photo-tile.selectable[data-selected="0"] img { opacity: 0.35; filter: grayscale(70%); }
+.photo-tile.selectable .tile-checkbox { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; z-index: 2; accent-color: var(--danger); }
+.tile-mark { position: absolute; top: 4px; left: 4px; z-index: 2; font-size: 11px; font-weight: 700; border-radius: 6px; padding: 2px 6px; display: none; }
+.tile-mark-del { background: rgba(255,59,48,0.85); color: #fff; }
+.tile-mark-keep { background: rgba(52,199,89,0.9); color: #fff; }
+.photo-tile.selectable[data-selected="1"] .tile-mark-del { display: block; }
+.photo-tile.selectable[data-selected="0"] .tile-mark-keep { display: block; }
+.batch-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 2px 10px; font-size: 13px; color: var(--secondary); font-weight: 600; }
+.batch-nav a { color: var(--accent); }
+.batch-nav .disabled { opacity: 0.35; }
 .group-card { margin-bottom: 14px; }
 .group-title { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
 .group-sub { color: var(--secondary); font-size: 12px; margin-bottom: 8px; }
@@ -248,6 +260,42 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
         {badge_html}
     </div>
     """
+
+def lb_img_tag_selectable(item: dict) -> str:
+    """分批清理用的可勾選相片格。預設勾選(=待搬移清理)，使用者點縮圖可切換成「保留」。"""
+    thumb = item.get("thumbnail_url") or item.get("thumbnailUrl") or ""
+    full = item.get("thumbnail_large_url") or item.get("thumbnailLargeUrl") or item.get("web_url") or item.get("webUrl") or thumb
+    name = (item.get("name") or "").replace('"', "&quot;")
+    taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
+    iid = item["id"]
+    return f"""
+    <label class="photo-tile selectable" data-selected="1">
+        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" loading="lazy" onclick="event.preventDefault(); event.stopPropagation(); this.closest('label').querySelector('.tile-checkbox').click();" />
+        <input type="checkbox" name="ids" value="{iid}" checked class="tile-checkbox" onchange="this.closest('.photo-tile').dataset.selected = this.checked ? '1' : '0'; updateBatchCount(this.closest('form'));" />
+        <div class="tile-mark tile-mark-del">🗑 清理</div>
+        <div class="tile-mark tile-mark-keep">✓ 保留</div>
+    </label>
+    """
+
+BATCH_CLEANUP_JS = """
+<script>
+function updateBatchCount(form){
+    if(!form) return;
+    var total = form.querySelectorAll('.tile-checkbox').length;
+    var checked = form.querySelectorAll('.tile-checkbox:checked').length;
+    var btn = form.querySelector('.batch-submit-btn');
+    if(btn) btn.textContent = '📦 移至「待清理資料夾」（已勾選 ' + checked + ' / ' + total + ' 張）';
+}
+function selectAllIn(form, state){
+    if(!form) return;
+    form.querySelectorAll('.tile-checkbox').forEach(function(cb){
+        cb.checked = state;
+        cb.closest('.photo-tile').dataset.selected = state ? '1' : '0';
+    });
+    updateBatchCount(form);
+}
+</script>
+"""
 
 app = FastAPI(title="我的相簿 App")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
@@ -960,6 +1008,8 @@ def get_cleanup_items(items: list[dict]) -> dict[str, list[dict]]:
             low_quality.append(it)
     return {"screenshots": screenshots, "low_quality": low_quality}
 
+CLEANUP_BATCH_SIZE = 50
+
 @app.get("/cleanup", response_class=HTMLResponse)
 async def cleanup_view(request: Request):
     sid = request.session.get("sid")
@@ -979,22 +1029,52 @@ async def cleanup_view(request: Request):
     grouped_screenshots = group_by_month(cleanup_data["screenshots"])
     grouped_low_quality = group_by_month(cleanup_data["low_quality"])
     
-    def build_month_sections(groups_dict, icon, title_prefix):
+    qp = dict(request.query_params)
+
+    def build_month_sections(groups_dict, icon, title_prefix, kind):
         html = ""
-        for month_key in sorted(groups_dict.keys(), reverse=True):
+        month_keys = sorted(groups_dict.keys(), reverse=True)
+        for group_idx, month_key in enumerate(month_keys):
             group_items = groups_dict[month_key]
-            thumbs = "".join(lb_img_tag(it) for it in group_items)
-            ids_str = ",".join(it["id"] for it in group_items)
-            
+            total = len(group_items)
+            total_pages = max(1, (total + CLEANUP_BATCH_SIZE - 1) // CLEANUP_BATCH_SIZE)
+            page_param = f"pg_{kind}_{group_idx}"
+            try:
+                page = int(qp.get(page_param, "0"))
+            except ValueError:
+                page = 0
+            page = max(0, min(page, total_pages - 1))
+            start = page * CLEANUP_BATCH_SIZE
+            batch_items = group_items[start:start + CLEANUP_BATCH_SIZE]
+
+            def page_url(target_page: int) -> str:
+                params = dict(qp)
+                params[page_param] = str(target_page)
+                return "/cleanup?" + urlencode(params)
+
+            prev_html = (f'<a href="{page_url(page - 1)}">‹ 上一批</a>' if page > 0
+                         else '<span class="disabled">‹ 上一批</span>')
+            next_html = (f'<a href="{page_url(page + 1)}">下一批 ›</a>' if page < total_pages - 1
+                         else '<span class="disabled">下一批 ›</span>')
+
+            thumbs = "".join(lb_img_tag_selectable(it) for it in batch_items)
+            form_id = f"cleanup_form_{kind}_{group_idx}_{page}"
+            batch_count = len(batch_items)
+
             html += f"""
             <div class="card group-card">
-                <div class="group-title">{icon} {title_prefix} - {month_key} (共 {len(group_items)} 張)</div>
-                <div class="group-sub" style="color: var(--warning); font-weight: bold;">向下滑動確認是否全為廢圖 👇</div>
-                <div class="photo-grid" style="margin-bottom: 12px;">{thumbs}</div>
-                <form action="/cleanup/batch-move" method="post" onsubmit="return confirm('確定要將 {month_key} 的這 {len(group_items)} 張照片，移至 OneDrive 的「待清理資料夾」嗎？');">
-                    <input type="hidden" name="ids" value="{ids_str}" />
-                    <button type="submit" class="btn-primary" style="background: var(--warning); color: #000; margin-top: 4px;">
-                        📦 移至「待清理資料夾」
+                <div class="group-title">{icon} {title_prefix} - {month_key}（共 {total} 張，第 {page + 1}/{total_pages} 批）</div>
+                <div class="group-sub" style="color: var(--warning); font-weight: bold;">預設全選為待清理，點照片可切換成「保留」👇</div>
+                <div class="batch-nav">{prev_html}<span>本批 {batch_count} 張</span>{next_html}</div>
+                <form id="{form_id}" action="/cleanup/batch-move" method="post" onsubmit="return confirm('確定要將本批已勾選的照片，移至 OneDrive 的「待清理資料夾」嗎？（標記保留的不會被搬移）');">
+                    <input type="hidden" name="redirect_to" value="{page_url(page)}" />
+                    <div class="photo-grid" style="margin-bottom: 12px;">{thumbs}</div>
+                    <div class="btn-row">
+                        <button type="button" class="btn-secondary" onclick="selectAllIn(document.getElementById('{form_id}'), true)">全選（本批）</button>
+                        <button type="button" class="btn-secondary" onclick="selectAllIn(document.getElementById('{form_id}'), false)">全部保留（本批）</button>
+                    </div>
+                    <button type="submit" class="btn-primary batch-submit-btn" style="background: var(--warning); color: #000; margin-top: 4px;">
+                        📦 移至「待清理資料夾」（已勾選 {batch_count} / {batch_count} 張）
                     </button>
                 </form>
             </div>
@@ -1005,8 +1085,9 @@ async def cleanup_view(request: Request):
     <div class="card banner-success">
         <h3 style="margin:0 0 8px 0;">🛡️ 啟用安全清理模式</h3>
         <p class="secondary" style="margin:0;">
-            <b>1. 分批預覽：</b>每次只處理單個月份，保證能看完全部照片不怕遺漏。<br>
-            <b>2. 安全緩衝區：</b>照片不會被刪除，而是移至 OneDrive 的 <b>「我的相簿_待清理垃圾桶」</b> 資料夾。確認沒問題後，再自行去 OneDrive 清空即可。
+            <b>1. 分批預覽：</b>每批最多 {CLEANUP_BATCH_SIZE} 張，可上下切換瀏覽，保證能看完全部照片不怕遺漏。<br>
+            <b>2. 預設全選：</b>本批照片預設全部標記為「待清理」，點一下照片就能改成「保留」，只有保留以外的才會被搬移。<br>
+            <b>3. 安全緩衝區：</b>照片不會被刪除，而是移至 OneDrive 的 <b>「我的相簿_待清理垃圾桶」</b> 資料夾。確認沒問題後，再自行去 OneDrive 清空即可。
         </p>
     </div>
     """
@@ -1016,22 +1097,38 @@ async def cleanup_view(request: Request):
     else:
         if cleanup_data["screenshots"]:
             body += f"""<div class="section-title">螢幕截圖分批清理</div>"""
-            body += build_month_sections(grouped_screenshots, "📱", "截圖")
+            body += build_month_sections(grouped_screenshots, "📱", "截圖", "screenshots")
         if cleanup_data["low_quality"]:
             body += f"""<div class="section-title">低畫質小檔案分批清理</div>"""
-            body += build_month_sections(grouped_low_quality, "🗑️", "小檔案")
+            body += build_month_sections(grouped_low_quality, "🗑️", "小檔案", "lowquality")
+        body += BATCH_CLEANUP_JS
             
     return HTMLResponse(page_shell("安全快速清理", body, active_tab="more", back_href="/more"))
 
+def _safe_cleanup_redirect(redirect_to: str | None) -> str:
+    if redirect_to and redirect_to.startswith("/cleanup"):
+        return redirect_to
+    return "/cleanup"
+
 @app.post("/cleanup/batch-move")
-async def cleanup_batch_move(request: Request, ids: str = Form(...)):
+async def cleanup_batch_move(request: Request):
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
     if not sid or not token: return RedirectResponse("/login")
 
-    id_list = [i for i in ids.split(",") if i]
+    form = await request.form()
+    # 勾選框皆為 name="ids" 的多個欄位(未勾選=保留、不會出現在表單中)；
+    # 仍相容舊版可能傳來的單一逗號字串。
+    raw_ids = form.getlist("ids")
+    id_list: list[str] = []
+    for raw in raw_ids:
+        raw = str(raw)
+        id_list.extend([i for i in raw.split(",") if i]) if "," in raw else id_list.append(raw)
+    id_list = [i for i in id_list if i]
+    dest = _safe_cleanup_redirect(str(form.get("redirect_to", "")))
+
     if not id_list:
-        return RedirectResponse("/cleanup", status_code=303)
+        return RedirectResponse(dest, status_code=303)
     
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
@@ -1084,7 +1181,7 @@ async def cleanup_batch_move(request: Request, ids: str = Form(...)):
             await asyncio.sleep(0.3)
 
     await backup_db_to_onedrive(sid, token)
-    return RedirectResponse("/cleanup", status_code=303)
+    return RedirectResponse(dest, status_code=303)
 
 # ---------------------------------------------------------------------------
 # 自動分類
