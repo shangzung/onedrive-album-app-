@@ -630,41 +630,62 @@ async def home(request: Request):
         return HTMLResponse(page_shell("我的相簿", body, active_tab="home", show_tabbar=False))
 
     photo_count = len(db_get_photos(sid))
-
-    # 安全網：已登入但本地是空的 → 自動再試一次還原（Docker 重啟常見）
     restore_banner = ""
+    meta_refresh = None
+    rr = RESTORE_STATUS.get(sid) or {}
+
+    # 本地是空的：背景還原，不要阻塞首頁（Render 逾時會 502）
     if photo_count == 0:
-        rr = await restore_db_from_onedrive(sid, token)
-        photo_count = rr.get("count") or len(db_get_photos(sid))
-        if rr.get("ok") and photo_count > 0:
+        if rr.get("status") == "running":
+            restore_banner = """
+            <div class="card banner-info">
+                <b>正在從 OneDrive 還原備份……</b>
+                <p class="secondary" style="margin:6px 0 0;">資料量較大時需要一點時間，頁面會自動更新。</p>
+            </div>
+            """
+            meta_refresh = 3
+        elif rr.get("ok") and (rr.get("count") or 0) > 0:
+            photo_count = len(db_get_photos(sid))
             restore_banner = f"""
             <div class="card banner-success">
                 <b>已從 OneDrive 還原 {photo_count} 張照片</b>
-                <p class="secondary" style="margin:6px 0 0;">容器重啟後本地資料會清空，已自動從雲端備份救回，無需重掃。</p>
+                <p class="secondary" style="margin:6px 0 0;">容器重啟後本地資料會清空，已自動從雲端備份救回。</p>
             </div>
             """
-        elif rr.get("error") or (not rr.get("ok")):
+        elif rr.get("error") or (rr.get("ok") is False and rr.get("message")):
             msg = rr.get("message") or rr.get("error") or "未知錯誤"
             restore_banner = f"""
             <div class="card banner-error">
                 <b>雲端還原失敗</b>
                 <p class="secondary" style="margin:6px 0 0;">{msg}</p>
-                <p class="secondary" style="margin:6px 0 0;">請點下方「增量掃描」或「強制全量重新掃描」。OneDrive 備份檔若存在，也可到「更多」再試一次。</p>
                 <a class="btn-secondary" href="/restore">再試一次還原</a>
             </div>
             """
+        else:
+            # 尚未開始 → 丟到背景執行
+            RESTORE_STATUS[sid] = {"status": "running", "ok": False, "count": 0, "message": "還原中…"}
+
+            async def _bg_restore(s=sid, t=token):
+                try:
+                    await restore_db_from_onedrive(s, t)
+                except Exception as e:
+                    RESTORE_STATUS[s] = {"ok": False, "count": 0, "message": str(e), "error": str(e), "status": "done"}
+
+            asyncio.create_task(_bg_restore())
+            restore_banner = """
+            <div class="card banner-info">
+                <b>正在從 OneDrive 還原備份……</b>
+                <p class="secondary" style="margin:6px 0 0;">資料量較大時需要一點時間，頁面會自動更新。</p>
+            </div>
+            """
+            meta_refresh = 3
     else:
-        # 顯示登入當下的還原提示（只顯示一次）
         msg = request.session.pop("restore_msg", None)
         ok = request.session.pop("restore_ok", None)
         if msg and ok and (request.session.pop("restore_count", 0) or 0) > 0:
-            restore_banner = f"""
-            <div class="card banner-success"><b>{msg}</b></div>
-            """
+            restore_banner = f'<div class="card banner-success"><b>{msg}</b></div>'
         elif msg and ok is False:
-            restore_banner = f"""
-            <div class="card banner-warning"><b>{msg}</b></div>
-            """
+            restore_banner = f'<div class="card banner-warning"><b>{msg}</b></div>'
 
     scan_state = SCAN_STATUS.get(sid, {}).get("status", "idle")
     scan_hint = {
@@ -706,7 +727,7 @@ async def home(request: Request):
         <a class="list-row tappable danger" href="/logout"><span class="row-icon">🚪</span><span class="row-label">登出</span></a>
     </div>
     """
-    return HTMLResponse(page_shell("我的相簿", body, active_tab="home"))
+    return HTMLResponse(page_shell("我的相簿", body, active_tab="home", meta_refresh=meta_refresh))
 
 @app.get("/more", response_class=HTMLResponse)
 async def more_page(request: Request):
@@ -766,11 +787,18 @@ async def callback(request: Request, code: str | None = None, state: str | None 
         TOKEN_STORE.pop(old_sid, None)
 
     _store_ms_token(sid, result)
-    restore_result = await restore_db_from_onedrive(sid, result["access_token"])
-    # 把還原結果記在 session，首頁可以顯示一次提示
-    request.session["restore_msg"] = restore_result.get("message") or ""
-    request.session["restore_ok"] = bool(restore_result.get("ok"))
-    request.session["restore_count"] = int(restore_result.get("count") or 0)
+    # 背景還原，避免 Render 在 callback 逾時變 502
+    if len(db_get_photos(sid)) == 0:
+        RESTORE_STATUS[sid] = {"status": "running", "ok": False, "count": 0, "message": "還原中…"}
+        token_copy = result["access_token"]
+
+        async def _bg_restore_login(s=sid, t=token_copy):
+            try:
+                await restore_db_from_onedrive(s, t)
+            except Exception as e:
+                RESTORE_STATUS[s] = {"ok": False, "count": 0, "message": str(e), "error": str(e), "status": "done"}
+
+        asyncio.create_task(_bg_restore_login())
     return RedirectResponse("/")
 
 @app.get("/logout")
@@ -782,15 +810,22 @@ async def logout(request: Request):
 
 @app.get("/restore")
 async def restore_page(request: Request):
-    """手動觸發從 OneDrive 還原備份（force=True，即使本地有資料也可覆蓋）。"""
+    """手動觸發從 OneDrive 還原備份（背景執行，避免 Render 502）。"""
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
     if not sid or not token:
         return RedirectResponse("/login", status_code=303)
-    rr = await restore_db_from_onedrive(sid, token, force=True)
-    request.session["restore_msg"] = rr.get("message") or ""
-    request.session["restore_ok"] = bool(rr.get("ok"))
-    request.session["restore_count"] = int(rr.get("count") or 0)
+    if RESTORE_STATUS.get(sid, {}).get("status") == "running":
+        return RedirectResponse("/", status_code=303)
+    RESTORE_STATUS[sid] = {"status": "running", "ok": False, "count": 0, "message": "還原中…"}
+
+    async def _bg(s=sid, t=token):
+        try:
+            await restore_db_from_onedrive(s, t, force=True)
+        except Exception as e:
+            RESTORE_STATUS[s] = {"ok": False, "count": 0, "message": str(e), "error": str(e), "status": "done"}
+
+    asyncio.create_task(_bg())
     return RedirectResponse("/", status_code=303)
 
 # ---------------------------------------------------------------------------
@@ -999,23 +1034,41 @@ async def restore_db_from_onedrive(sid: str, token: str | None, force: bool = Fa
         RESTORE_STATUS[sid] = result
         return result
 
-    # /content 常會 302 到 SharePoint 真正下載網址，必須 follow_redirects=True
-    url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
+    # 不要用 /content（會 302 且帶 Bearer 轉到 SharePoint 常失敗）
+    # 正確做法：先取 @microsoft.graph.downloadUrl，再用「無 Authorization」下載
+    meta_url = (
+        f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}"
+        f"?$select=id,name,size,@microsoft.graph.downloadUrl"
+    )
     headers = {"Authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 404:
+            meta_resp = await client.get(meta_url, headers=headers)
+            if meta_resp.status_code == 404:
                 result["message"] = "OneDrive 尚無備份檔（可能還沒掃過）"
                 RESTORE_STATUS[sid] = result
                 return result
-            # 少數環境仍回 302，再手動跟一次
-            if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
-                loc = resp.headers["location"]
-                # 轉到 sharepoint 下載網址時通常不需再帶 Graph Bearer
-                resp = await client.get(loc, timeout=180)
-            resp.raise_for_status()
-            raw = resp.content
+            meta_resp.raise_for_status()
+            meta = meta_resp.json()
+            download_url = meta.get("@microsoft.graph.downloadUrl")
+
+            raw = b""
+            if download_url:
+                # 預簽章 URL，不可再帶 Bearer
+                dl = await client.get(download_url, timeout=180)
+                dl.raise_for_status()
+                raw = dl.content
+            else:
+                # 極少數情況沒有 downloadUrl，再退回 /content（手動處理 302、轉址時去掉 Authorization）
+                content_url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
+                resp = await client.get(content_url, headers=headers, follow_redirects=False)
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("location")
+                    if not loc:
+                        raise RuntimeError("收到轉址但沒有 Location")
+                    resp = await client.get(loc, timeout=180)  # 不帶 headers
+                resp.raise_for_status()
+                raw = resp.content
 
         if not raw:
             result["message"] = "備份檔下載後是空的"
@@ -1036,12 +1089,14 @@ async def restore_db_from_onedrive(sid: str, token: str | None, force: bool = Fa
         final = len(db_get_photos(sid))
         result["ok"] = True
         result["count"] = final
+        result["status"] = "done"
         result["message"] = f"已從 OneDrive 還原 {final} 張照片"
         print(f"還原成功 sid={sid} count={final}")
         RESTORE_STATUS[sid] = result
         return result
     except Exception as e:
         result["error"] = str(e)
+        result["status"] = "done"
         result["message"] = f"還原失敗：{e}"
         print(f"從 OneDrive 還原 photos.db 失敗(sid={sid}): {e}")
         RESTORE_STATUS[sid] = result
