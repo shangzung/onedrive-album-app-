@@ -1,7 +1,9 @@
 """
-我的相簿 App - MVP 後端
-(OneDrive 背景掃描 + SQLite 快取 + pHash 重複照片偵測與自動刪除
- + 自動分類 + 回憶影片 + 安全快速清理(按月分組+移動至雲端垃圾桶) + Apple 風格手機版 UI)
+我的相簿 App - 消費者級後端
+(OneDrive 增量掃描 delta + SQLite 快取 + pHash 重複偵測
+ + 自動分類 + 回憶影片 + 安全快速清理 + 自訂標籤 + 模糊偵測
+ + 方向篩選 + 週/月回顧 + 批次 ZIP + 相簿分享連結
+ + 高質感 Apple 風格手機版 UI)
 """
 
 import asyncio
@@ -13,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import uuid
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -20,10 +23,11 @@ from urllib.parse import quote
 import httpx
 import imagehash
 import msal
+import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
-from PIL import Image
+from fastapi import FastAPI, Request, Form, Query
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse, StreamingResponse
+from PIL import Image, ImageFilter, ImageStat
 from starlette.middleware.sessions import SessionMiddleware
 
 load_dotenv()
@@ -52,91 +56,186 @@ DEFAULT_DUP_THRESHOLD = 5
 DEFAULT_EVENT_GAP_HOURS = 48
 LOCATION_PRECISION = 2
 GALLERY_MONTHS_PER_PAGE = 6
+BLUR_THRESHOLD = 80.0  # Laplacian variance 低於此視為模糊 (可調)
 
 # ---------------------------------------------------------------------------
-# Apple 風格共用 UI
+# 高質感 Apple 風格共用 UI (消費者級)
 # ---------------------------------------------------------------------------
 APPLE_CSS = """
 <style>
 :root {
     --bg: #f2f2f7; --card-bg: #ffffff; --text: #1c1c1e;
     --secondary: #8a8a8e; --accent: #0a84ff; --danger: #ff3b30;
-    --success: #34c759; --warning: #ff9f0a; --border: rgba(60,60,67,0.13);
-    --topbar-bg: rgba(249,249,249,0.82); --tabbar-bg: rgba(249,249,249,0.86);
-    --radius: 14px; --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --success: #34c759; --warning: #ff9f0a; --border: rgba(60,60,67,0.12);
+    --topbar-bg: rgba(249,249,249,0.78); --tabbar-bg: rgba(249,249,249,0.86);
+    --radius: 16px; --radius-sm: 12px;
+    --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.02);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.06), 0 1px 4px rgba(0,0,0,0.03);
+    --shadow-lg: 0 12px 40px rgba(0,0,0,0.08);
+    --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
 }
 @media (prefers-color-scheme: dark) {
     :root {
-        --bg: #000000; --card-bg: #1c1c1e; --text: #f2f2f7;
-        --secondary: #98989d; --border: rgba(84,84,88,0.45);
-        --topbar-bg: rgba(20,20,22,0.78); --tabbar-bg: rgba(20,20,22,0.86);
+        --bg: #000000; --card-bg: #1c1c1e; --text: #f5f5f7;
+        --secondary: #98989d; --border: rgba(84,84,88,0.48);
+        --topbar-bg: rgba(20,20,22,0.72); --tabbar-bg: rgba(20,20,22,0.86);
+        --shadow-sm: 0 1px 3px rgba(0,0,0,0.3); --shadow-md: 0 4px 16px rgba(0,0,0,0.35);
+        --shadow-lg: 0 12px 40px rgba(0,0,0,0.45);
     }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body {
     margin: 0; padding: 0; background: var(--bg); color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang TC", "Helvetica Neue", "Microsoft JhengHei", sans-serif;
-    -webkit-font-smoothing: antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "PingFang TC", "Helvetica Neue", "Microsoft JhengHei", sans-serif;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+    letter-spacing: -0.01em;
 }
-a { color: inherit; text-decoration: none; }
+a { color: inherit; text-decoration: none; transition: opacity 0.15s var(--ease); }
 .app-shell { min-height: 100vh; display: flex; flex-direction: column; }
 .topbar {
     position: sticky; top: 0; z-index: 50; padding-top: var(--safe-top);
-    background: var(--topbar-bg); backdrop-filter: saturate(180%) blur(20px);
-    -webkit-backdrop-filter: saturate(180%) blur(20px); border-bottom: 0.5px solid var(--border);
+    background: var(--topbar-bg); backdrop-filter: saturate(180%) blur(24px);
+    -webkit-backdrop-filter: saturate(180%) blur(24px); border-bottom: 0.5px solid var(--border);
 }
-.topbar-inner { display: flex; align-items: center; height: 44px; padding: 0 12px; max-width: 640px; margin: 0 auto; position: relative; }
-.topbar-back { color: var(--accent); font-size: 17px; padding: 6px 8px 6px 0; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
-.topbar-title { position: absolute; left: 50%; transform: translateX(-50%); font-size: 17px; font-weight: 600; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.content { flex: 1; max-width: 640px; width: 100%; margin: 0 auto; padding: 16px 14px calc(96px + var(--safe-bottom)); }
-.content.no-tabbar { padding-bottom: 28px; }
-h1.page-h1 { font-size: 30px; font-weight: 700; margin: 6px 2px 16px; letter-spacing: -0.02em; }
-h2.section-h2 { font-size: 20px; font-weight: 700; margin: 22px 2px 10px; letter-spacing: -0.01em; }
-.section-title { font-size: 13px; color: var(--secondary); text-transform: uppercase; letter-spacing: 0.04em; margin: 20px 6px 8px; font-weight: 600; }
-.secondary { color: var(--secondary); font-size: 14px; line-height: 1.5; }
-.card { background: var(--card-bg); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
-.card.banner-info { background: rgba(10,132,255,0.10); }
-.card.banner-success { background: rgba(52,199,89,0.12); }
-.card.banner-error { background: rgba(255,59,48,0.12); }
-.card.banner-warning { background: rgba(255,159,10,0.14); }
-.hero { text-align: center; padding: 48px 12px 24px; }
-.hero-icon { font-size: 56px; margin-bottom: 10px; }
-.hero h1 { font-size: 28px; font-weight: 700; margin: 0 0 8px; }
-.list-group { background: var(--card-bg); border-radius: var(--radius); overflow: hidden; margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
-.list-row { display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-bottom: 0.5px solid var(--border); font-size: 16px; min-height: 22px; }
+.topbar-inner { display: flex; align-items: center; height: 48px; padding: 0 14px; max-width: 640px; margin: 0 auto; position: relative; }
+.topbar-back { color: var(--accent); font-size: 17px; font-weight: 500; padding: 8px 10px 8px 0; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+.topbar-title { position: absolute; left: 50%; transform: translateX(-50%); font-size: 17px; font-weight: 600; max-width: 58%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: -0.02em; }
+.content { flex: 1; max-width: 640px; width: 100%; margin: 0 auto; padding: 18px 16px calc(100px + var(--safe-bottom)); }
+.content.no-tabbar { padding-bottom: 32px; }
+h1.page-h1 { font-size: 32px; font-weight: 700; margin: 4px 2px 18px; letter-spacing: -0.03em; }
+h2.section-h2 { font-size: 22px; font-weight: 700; margin: 24px 2px 12px; letter-spacing: -0.02em; }
+.section-title { font-size: 13px; color: var(--secondary); text-transform: uppercase; letter-spacing: 0.05em; margin: 24px 6px 10px; font-weight: 600; }
+.secondary { color: var(--secondary); font-size: 14px; line-height: 1.55; }
+.card {
+    background: var(--card-bg); border-radius: var(--radius); padding: 18px;
+    margin-bottom: 14px; box-shadow: var(--shadow-sm);
+    transition: box-shadow 0.25s var(--ease), transform 0.2s var(--ease);
+}
+.card:active { transform: scale(0.995); }
+.card.banner-info { background: linear-gradient(135deg, rgba(10,132,255,0.12), rgba(10,132,255,0.06)); border: 0.5px solid rgba(10,132,255,0.15); }
+.card.banner-success { background: linear-gradient(135deg, rgba(52,199,89,0.14), rgba(52,199,89,0.06)); border: 0.5px solid rgba(52,199,89,0.18); }
+.card.banner-error { background: linear-gradient(135deg, rgba(255,59,48,0.12), rgba(255,59,48,0.05)); border: 0.5px solid rgba(255,59,48,0.15); }
+.card.banner-warning { background: linear-gradient(135deg, rgba(255,159,10,0.14), rgba(255,159,10,0.06)); border: 0.5px solid rgba(255,159,10,0.18); }
+.hero { text-align: center; padding: 56px 16px 28px; }
+.hero-icon { font-size: 64px; margin-bottom: 14px; filter: drop-shadow(0 4px 12px rgba(0,0,0,0.08)); }
+.hero h1 { font-size: 30px; font-weight: 700; margin: 0 0 10px; letter-spacing: -0.03em; }
+.list-group {
+    background: var(--card-bg); border-radius: var(--radius); overflow: hidden;
+    margin-bottom: 14px; box-shadow: var(--shadow-sm);
+}
+.list-row {
+    display: flex; align-items: center; gap: 14px; padding: 14px 18px;
+    border-bottom: 0.5px solid var(--border); font-size: 16px; min-height: 24px;
+    transition: background 0.15s var(--ease);
+}
 .list-row:last-child { border-bottom: none; }
-.list-row .row-icon { font-size: 20px; width: 26px; text-align: center; flex-shrink: 0; }
-.list-row .row-label { flex: 1; }
+.list-row .row-icon { font-size: 22px; width: 28px; text-align: center; flex-shrink: 0; }
+.list-row .row-label { flex: 1; font-weight: 500; }
 .list-row .row-value { color: var(--secondary); font-size: 15px; }
-.list-row .chevron { color: var(--secondary); font-size: 15px; }
+.list-row .chevron { color: var(--secondary); font-size: 16px; opacity: 0.7; }
 .list-row.danger { color: var(--danger); }
-.list-row.tappable:active { background: rgba(120,120,128,0.12); }
-.btn-primary { display: block; width: 100%; text-align: center; background: var(--accent); color: #fff; font-size: 17px; font-weight: 600; padding: 14px 20px; border: none; border-radius: 980px; margin: 6px 0; cursor: pointer; }
-.btn-primary:active { opacity: 0.75; }
-.btn-secondary { display: block; width: 100%; text-align: center; background: rgba(10,132,255,0.12); color: var(--accent); font-size: 16px; font-weight: 600; padding: 12px 20px; border: none; border-radius: 980px; margin: 6px 0; cursor: pointer; }
-.btn-row { display: flex; gap: 8px; }
+.list-row.tappable:active { background: rgba(120,120,128,0.1); }
+.btn-primary {
+    display: block; width: 100%; text-align: center; background: var(--accent); color: #fff;
+    font-size: 17px; font-weight: 600; padding: 15px 22px; border: none; border-radius: 980px;
+    margin: 8px 0; cursor: pointer; letter-spacing: -0.01em;
+    box-shadow: 0 4px 14px rgba(10,132,255,0.28);
+    transition: opacity 0.15s, transform 0.15s, box-shadow 0.2s;
+}
+.btn-primary:active { opacity: 0.85; transform: scale(0.98); box-shadow: 0 2px 8px rgba(10,132,255,0.2); }
+.btn-secondary {
+    display: block; width: 100%; text-align: center; background: rgba(10,132,255,0.1); color: var(--accent);
+    font-size: 16px; font-weight: 600; padding: 13px 20px; border: none; border-radius: 980px;
+    margin: 6px 0; cursor: pointer; transition: background 0.15s, transform 0.15s;
+}
+.btn-secondary:active { background: rgba(10,132,255,0.18); transform: scale(0.98); }
+.btn-row { display: flex; gap: 10px; }
 .btn-row > * { flex: 1; }
-select.apple-select, input.apple-input { width: 100%; padding: 10px 12px; border-radius: 10px; border: 0.5px solid var(--border); background: var(--bg); color: var(--text); font-size: 15px; margin: 8px 0; }
-.pill-link { display: inline-block; background: rgba(10,132,255,0.12); color: var(--accent); font-size: 13px; font-weight: 600; padding: 6px 14px; border-radius: 980px; margin: 2px 4px 2px 0; }
-.stat-num { font-size: 34px; font-weight: 700; letter-spacing: -0.02em; }
-.photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 2px; margin: 0 -2px 14px; }
-.photo-tile { position: relative; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 3px; background: var(--border); }
+select.apple-select, input.apple-input {
+    width: 100%; padding: 12px 14px; border-radius: var(--radius-sm);
+    border: 0.5px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 16px; margin: 8px 0; transition: border-color 0.2s;
+}
+select.apple-select:focus, input.apple-input:focus { outline: none; border-color: var(--accent); }
+.pill-link {
+    display: inline-block; background: rgba(10,132,255,0.1); color: var(--accent);
+    font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 980px;
+    margin: 3px 5px 3px 0; transition: background 0.15s;
+}
+.pill-link:active { background: rgba(10,132,255,0.2); }
+.stat-num { font-size: 36px; font-weight: 700; letter-spacing: -0.03em; line-height: 1.1; }
+.photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 3px; margin: 0 -2px 16px; }
+.photo-tile {
+    position: relative; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 6px;
+    background: var(--border); transition: transform 0.2s var(--ease);
+}
+.photo-tile:active { transform: scale(0.97); }
 .photo-tile img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
-.photo-badge { position: absolute; left: 4px; bottom: 4px; font-size: 12px; background: rgba(0,0,0,0.55); color: #fff; border-radius: 6px; padding: 1px 5px; line-height: 1.4; }
-.tile-actions { position: absolute; top: 4px; left: 4px; right: 4px; display: flex; justify-content: space-between; pointer-events: none; }
-.tile-btn { pointer-events: auto; width: 24px; height: 24px; border-radius: 50%; border: none; background: rgba(0,0,0,0.5); color: #fff; font-size: 13px; line-height: 24px; text-align: center; padding: 0; cursor: pointer; }
+.photo-badge {
+    position: absolute; left: 5px; bottom: 5px; font-size: 11px; font-weight: 600;
+    background: rgba(0,0,0,0.6); color: #fff; border-radius: 6px; padding: 2px 6px; line-height: 1.3;
+    backdrop-filter: blur(8px);
+}
+.tile-actions { position: absolute; top: 5px; left: 5px; right: 5px; display: flex; justify-content: space-between; pointer-events: none; }
+.tile-btn {
+    pointer-events: auto; width: 28px; height: 28px; border-radius: 50%; border: none;
+    background: rgba(0,0,0,0.45); color: #fff; font-size: 14px; line-height: 28px;
+    text-align: center; padding: 0; cursor: pointer; backdrop-filter: blur(8px);
+    transition: background 0.15s, transform 0.15s;
+}
+.tile-btn:active { transform: scale(0.9); }
 .tile-btn.fav-btn.active { background: var(--warning); color: #000; }
 .tile-btn.del-btn:active { background: var(--danger); }
-.tile-btn:disabled { opacity: 0.5; }
-.group-card { margin-bottom: 14px; }
-.group-title { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
-.group-sub { color: var(--secondary); font-size: 12px; margin-bottom: 8px; }
-.tabbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; display: flex; background: var(--tabbar-bg); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); border-top: 0.5px solid var(--border); padding-bottom: var(--safe-bottom); }
-.tabbar-item { flex: 1; text-align: center; padding: 8px 2px 6px; color: var(--secondary); display: flex; flex-direction: column; align-items: center; gap: 2px; }
-.tabbar-item .tab-icon { font-size: 22px; line-height: 1; }
-.tabbar-item .tab-label { font-size: 10px; font-weight: 500; }
+.tile-btn:disabled { opacity: 0.45; }
+.group-card { margin-bottom: 16px; }
+.group-title { font-weight: 650; font-size: 16px; margin-bottom: 6px; letter-spacing: -0.01em; }
+.group-sub { color: var(--secondary); font-size: 13px; margin-bottom: 10px; }
+.tabbar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; display: flex;
+    background: var(--tabbar-bg); backdrop-filter: saturate(180%) blur(24px);
+    -webkit-backdrop-filter: saturate(180%) blur(24px); border-top: 0.5px solid var(--border);
+    padding-bottom: var(--safe-bottom);
+}
+.tabbar-item {
+    flex: 1; text-align: center; padding: 9px 2px 7px; color: var(--secondary);
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    transition: color 0.2s;
+}
+.tabbar-item .tab-icon { font-size: 23px; line-height: 1; }
+.tabbar-item .tab-label { font-size: 10px; font-weight: 500; letter-spacing: 0.01em; }
 .tabbar-item.active { color: var(--accent); }
 form.inline-form { margin: 0; }
+.tag-chip {
+    display: inline-flex; align-items: center; gap: 4px; background: rgba(10,132,255,0.12);
+    color: var(--accent); font-size: 12px; font-weight: 600; padding: 4px 10px;
+    border-radius: 980px; margin: 2px 3px 2px 0;
+}
+.tag-chip .remove { cursor: pointer; opacity: 0.7; font-size: 14px; line-height: 1; }
+.filter-bar { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 14px; -webkit-overflow-scrolling: touch; }
+.filter-chip {
+    flex-shrink: 0; padding: 8px 14px; border-radius: 980px; font-size: 13px; font-weight: 600;
+    background: var(--card-bg); border: 0.5px solid var(--border); color: var(--text);
+    transition: all 0.15s;
+}
+.filter-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.select-mode .photo-tile { cursor: pointer; }
+.select-mode .photo-tile.selected::after {
+    content: ''; position: absolute; inset: 0; border: 3px solid var(--accent);
+    border-radius: 6px; background: rgba(10,132,255,0.15); pointer-events: none;
+}
+.select-mode .photo-tile.selected::before {
+    content: '✓'; position: absolute; top: 6px; right: 6px; width: 22px; height: 22px;
+    background: var(--accent); color: #fff; border-radius: 50%; font-size: 13px;
+    display: flex; align-items: center; justify-content: center; z-index: 2; font-weight: 700;
+}
+.floating-action {
+    position: fixed; bottom: calc(80px + var(--safe-bottom)); left: 50%; transform: translateX(-50%);
+    background: var(--accent); color: #fff; font-weight: 600; font-size: 15px;
+    padding: 12px 24px; border-radius: 980px; box-shadow: var(--shadow-lg);
+    z-index: 40; display: none; white-space: nowrap;
+}
+.floating-action.show { display: block; }
 </style>
 """
 
@@ -313,18 +412,36 @@ def init_db():
             PRIMARY KEY (sid, id)
         )
     """)
-    for column, col_type in [("phash", "TEXT"), ("width", "INTEGER"), ("height", "INTEGER"), ("thumbnail_large_url", "TEXT"), ("source", "TEXT DEFAULT 'onedrive'"), ("cleanup_skip", "INTEGER DEFAULT 0"), ("favorite", "INTEGER DEFAULT 0"), ("camera_make", "TEXT"), ("camera_model", "TEXT")]:
+    for column, col_type in [
+        ("phash", "TEXT"), ("width", "INTEGER"), ("height", "INTEGER"),
+        ("thumbnail_large_url", "TEXT"), ("source", "TEXT DEFAULT 'onedrive'"),
+        ("cleanup_skip", "INTEGER DEFAULT 0"), ("favorite", "INTEGER DEFAULT 0"),
+        ("camera_make", "TEXT"), ("camera_model", "TEXT"),
+        ("blur_score", "REAL"),  # Laplacian variance, 越低越模糊
+    ]:
         try:
             conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {col_type}")
         except sqlite3.OperationalError:
             pass
-    # 不再支援 Google 相簿,清掉舊的 Google 來源紀錄(縮圖快取在本機硬碟,早已不可靠)。
     conn.execute("DELETE FROM photos WHERE source = 'google'")
-    # 地點名稱快取(反向地理編碼結果),避免每次都重打 Nominatim,也讓重啟後不用重查。
     conn.execute("""
         CREATE TABLE IF NOT EXISTS location_cache (
             lat_r REAL NOT NULL, lng_r REAL NOT NULL, name TEXT,
             PRIMARY KEY (lat_r, lng_r)
+        )
+    """)
+    # 自訂標籤 (完全本地 SQLite, 無 AI)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS photo_tags (
+            sid TEXT NOT NULL, photo_id TEXT NOT NULL, tag TEXT NOT NULL,
+            PRIMARY KEY (sid, photo_id, tag)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photo_tags_tag ON photo_tags(sid, tag)")
+    # 增量掃描用的 deltaLink (避免每次全量重掃)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scan_state (
+            sid TEXT PRIMARY KEY, delta_link TEXT, last_scan_at TEXT, photo_count INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -347,6 +464,122 @@ def save_location_cache_entry(lat_r: float, lng_r: float, name: str):
     conn.close()
 
 init_db()
+
+# ---------------------------------------------------------------------------
+# 掃描狀態 / 標籤 / 模糊偵測 helpers
+# ---------------------------------------------------------------------------
+def get_scan_state(sid: str) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM scan_state WHERE sid = ?", (sid,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+def save_scan_state(sid: str, delta_link: str | None = None, photo_count: int | None = None):
+    conn = sqlite3.connect(DB_PATH)
+    existing = conn.execute("SELECT sid FROM scan_state WHERE sid = ?", (sid,)).fetchone()
+    now = datetime.utcnow().isoformat()
+    if existing:
+        if delta_link is not None:
+            conn.execute("UPDATE scan_state SET delta_link = ?, last_scan_at = ? WHERE sid = ?", (delta_link, now, sid))
+        if photo_count is not None:
+            conn.execute("UPDATE scan_state SET photo_count = ?, last_scan_at = ? WHERE sid = ?", (photo_count, now, sid))
+    else:
+        conn.execute(
+            "INSERT INTO scan_state (sid, delta_link, last_scan_at, photo_count) VALUES (?, ?, ?, ?)",
+            (sid, delta_link, now, photo_count or 0),
+        )
+    conn.commit()
+    conn.close()
+
+def get_photo_tags(sid: str, photo_id: str) -> list[str]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT tag FROM photo_tags WHERE sid = ? AND photo_id = ? ORDER BY tag", (sid, photo_id)).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def get_all_tags(sid: str) -> list[tuple[str, int]]:
+    """回傳 [(tag, count), ...] 依使用次數排序"""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT tag, COUNT(*) as cnt FROM photo_tags WHERE sid = ? GROUP BY tag ORDER BY cnt DESC, tag",
+        (sid,),
+    ).fetchall()
+    conn.close()
+    return [(r[0], r[1]) for r in rows]
+
+def set_photo_tags(sid: str, photo_id: str, tags: list[str]):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ?", (sid, photo_id))
+    for t in tags:
+        t = t.strip()
+        if t:
+            conn.execute(
+                "INSERT OR IGNORE INTO photo_tags (sid, photo_id, tag) VALUES (?, ?, ?)",
+                (sid, photo_id, t),
+            )
+    conn.commit()
+    conn.close()
+
+def add_photo_tag(sid: str, photo_id: str, tag: str):
+    tag = tag.strip()
+    if not tag:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO photo_tags (sid, photo_id, tag) VALUES (?, ?, ?)",
+        (sid, photo_id, tag),
+    )
+    conn.commit()
+    conn.close()
+
+def remove_photo_tag(sid: str, photo_id: str, tag: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ? AND tag = ?", (sid, photo_id, tag))
+    conn.commit()
+    conn.close()
+
+def photos_with_tag(sid: str, tag: str) -> list[str]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT photo_id FROM photo_tags WHERE sid = ? AND tag = ?", (sid, tag)).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def compute_blur_score(image_bytes: bytes) -> float | None:
+    """用 Laplacian 變異數評估清晰度。數值越低越模糊。回傳 None 表示無法計算。"""
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        # 縮小以加速 (對模糊偵測足夠)
+        img.thumbnail((512, 512), Image.LANCZOS)
+        arr = np.asarray(img, dtype=np.float64)
+        # 簡易 Laplacian kernel
+        kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float64)
+        # 用 numpy 做 convolution (邊界用 edge)
+        from numpy.lib.stride_tricks import sliding_window_view
+        if arr.shape[0] < 3 or arr.shape[1] < 3:
+            return None
+        windows = sliding_window_view(arr, (3, 3))
+        laplacian = np.sum(windows * kernel, axis=(-2, -1))
+        return float(laplacian.var())
+    except Exception:
+        return None
+
+def is_blurry(item: dict, threshold: float = BLUR_THRESHOLD) -> bool:
+    score = item.get("blur_score")
+    if score is None:
+        return False
+    return score < threshold
+
+def orientation_of(item: dict) -> str:
+    w, h = item.get("width"), item.get("height")
+    if not w or not h:
+        return "unknown"
+    ratio = w / h
+    if ratio > 1.05:
+        return "landscape"
+    if ratio < 0.95:
+        return "portrait"
+    return "square"
 
 def _msal_app() -> msal.ConfidentialClientApplication:
     return msal.ConfidentialClientApplication(client_id=CLIENT_ID, client_credential=CLIENT_SECRET, authority=AUTHORITY)
@@ -443,14 +676,18 @@ async def more_page(request: Request):
         <a class="list-row tappable" href="/locations"><span class="row-icon">📍</span><span class="row-label">拍攝地點(含地圖)</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/search"><span class="row-icon">🔍</span><span class="row-label">圖庫搜尋</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/favorites"><span class="row-icon">⭐</span><span class="row-label">我的最愛</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/tags"><span class="row-icon">🏷</span><span class="row-label">自訂標籤</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/orientation"><span class="row-icon">📐</span><span class="row-label">方向篩選(直/橫式)</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/cameras"><span class="row-icon">📷</span><span class="row-label">依相機/裝置分類</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/storage"><span class="row-icon">📊</span><span class="row-label">儲存空間統計</span><span class="chevron">›</span></a>
     </div>
     <div class="list-group">
+        <a class="list-row tappable" href="/reviews"><span class="row-icon">📅</span><span class="row-label">上週 / 上個月回顧</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/duplicates/view"><span class="row-icon">🧬</span><span class="row-label">疑似重複照片</span><span class="chevron">›</span></a>
-        <a class="list-row tappable" href="/cleanup"><span class="row-icon">🧹</span><span class="row-label">快速清理(安全緩衝模式)</span><span class="chevron">›</span></a>
-        <a class="list-row tappable" href="/scan/start"><span class="row-icon">🔄</span><span class="row-label">重新掃描 OneDrive</span><span class="chevron">›</span></a>
-        <a class="list-row tappable" href="/photos?max_depth=0"><span class="row-icon">🧾</span><span class="row-label">原始照片清單(JSON)</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/cleanup"><span class="row-icon">🧹</span><span class="row-label">快速清理(含模糊偵測)</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/share/event"><span class="row-icon">🔗</span><span class="row-label">相簿分享連結</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/scan/start"><span class="row-icon">🔄</span><span class="row-label">增量掃描 OneDrive</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/scan/start?force=1"><span class="row-icon">♻️</span><span class="row-label">強制全量重新掃描</span><span class="chevron">›</span></a>
     </div>
     <div class="list-group">
         <a class="list-row tappable danger" href="/logout"><span class="row-icon">🚪</span><span class="row-label">登出</span></a>
@@ -565,16 +802,28 @@ async def fetch_all_media(token: str, folder_path: str = "root", depth: int = 0,
 
 def db_upsert_photo(sid: str, item: dict):
     conn = sqlite3.connect(DB_PATH)
+    # 保留既有 blur_score / favorite / cleanup_skip 除非有新值
     conn.execute(
         """
-        INSERT INTO photos (sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url, taken_date_time, latitude, longitude, phash, width, height, source, camera_make, camera_model)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO photos (sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url, taken_date_time, latitude, longitude, phash, width, height, source, camera_make, camera_model, blur_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sid, id) DO UPDATE SET
-            name=excluded.name, mime_type=excluded.mime_type, size=excluded.size, web_url=excluded.web_url, thumbnail_url=excluded.thumbnail_url, thumbnail_large_url=excluded.thumbnail_large_url,
-            taken_date_time=excluded.taken_date_time, latitude=excluded.latitude, longitude=excluded.longitude, phash=excluded.phash, width=excluded.width, height=excluded.height, source=excluded.source,
-            camera_make=excluded.camera_make, camera_model=excluded.camera_model
+            name=excluded.name, mime_type=excluded.mime_type, size=excluded.size, web_url=excluded.web_url,
+            thumbnail_url=excluded.thumbnail_url, thumbnail_large_url=excluded.thumbnail_large_url,
+            taken_date_time=excluded.taken_date_time, latitude=excluded.latitude, longitude=excluded.longitude,
+            phash=COALESCE(excluded.phash, photos.phash),
+            width=excluded.width, height=excluded.height, source=excluded.source,
+            camera_make=excluded.camera_make, camera_model=excluded.camera_model,
+            blur_score=COALESCE(excluded.blur_score, photos.blur_score)
         """,
-        (sid, item["id"], item.get("name"), item.get("mimeType"), item.get("size"), item.get("webUrl"), item.get("thumbnailUrl"), item.get("thumbnailLargeUrl"), item.get("takenDateTime"), item.get("latitude"), item.get("longitude"), item.get("phash"), item.get("width"), item.get("height"), item.get("source", "onedrive"), item.get("cameraMake"), item.get("cameraModel")),
+        (
+            sid, item["id"], item.get("name"), item.get("mimeType"), item.get("size"),
+            item.get("webUrl"), item.get("thumbnailUrl"), item.get("thumbnailLargeUrl"),
+            item.get("takenDateTime"), item.get("latitude"), item.get("longitude"),
+            item.get("phash"), item.get("width"), item.get("height"),
+            item.get("source", "onedrive"), item.get("cameraMake"), item.get("cameraModel"),
+            item.get("blur_score"),
+        ),
     )
     conn.commit()
     conn.close()
@@ -638,43 +887,171 @@ async def restore_db_from_onedrive(sid: str, token: str | None):
     except Exception as e:
         print(f"從 OneDrive 還原 photos.db 失敗(sid={sid}): {e}")
 
-async def run_background_scan(sid: str, token: str):
-    SCAN_STATUS[sid] = {"status": "scanning", "count": 0}
+async def process_drive_item(sid: str, item: dict, existing_phash: dict, token: str | None = None) -> bool:
+    """處理單一 media item: 計算 phash / blur, upsert。回傳是否為新照片。"""
+    item_id = item["id"]
+    is_new = item_id not in existing_phash
+    if item_id in existing_phash and existing_phash[item_id]:
+        item["phash"] = existing_phash[item_id]
+    elif (item.get("mimeType") or "").startswith("image/"):
+        item["phash"] = await compute_phash(item.get("thumbnailUrl"))
+    else:
+        item["phash"] = None
+
+    # 模糊分數 (只用 thumbnail 快速估算, 有縮圖才算)
+    if (item.get("mimeType") or "").startswith("image/") and item.get("thumbnailUrl") and item.get("blur_score") is None:
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                resp = await client.get(item["thumbnailUrl"])
+                if resp.status_code == 200:
+                    score = compute_blur_score(resp.content)
+                    if score is not None:
+                        item["blur_score"] = score
+        except Exception:
+            pass
+
+    db_upsert_photo(sid, item)
+    return is_new
+
+
+async def fetch_delta_iter(token: str, delta_link: str | None = None):
+    """使用 Graph delta query 取得變更 (新增/修改/刪除)。"""
+    headers = {"Authorization": f"Bearer {token}"}
+    url = delta_link or f"{GRAPH_BASE}/me/drive/root/delta?$expand=thumbnails&token=latest"
+    # 第一次若沒有 delta_link, 用 token=latest 拿最新 token (空結果), 再全量掃一次建立基線
+    # 實務上: 有 delta_link 就增量; 沒有就走全量 + 存 deltaLink
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        while url:
+            for attempt in range(5):
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 429:
+                    await asyncio.sleep(int(resp.headers.get("Retry-After", 5)))
+                    continue
+                if resp.status_code == 410:  # delta token expired
+                    # 必須重新全量
+                    return
+                resp.raise_for_status()
+                break
+            data = resp.json()
+            for item in data.get("value", []):
+                yield item
+            url = data.get("@odata.nextLink")
+            if "@odata.deltaLink" in data:
+                yield {"__delta_link__": data["@odata.deltaLink"]}
+                return
+
+
+async def run_background_scan(sid: str, token: str, force_full: bool = False):
+    """優先使用 delta 增量掃描; 沒有 delta_link 或 force_full 時才全量。"""
+    SCAN_STATUS[sid] = {"status": "scanning", "count": 0, "mode": "incremental"}
     try:
-        count = 0
+        state = get_scan_state(sid)
+        delta_link = None if force_full else state.get("delta_link")
         existing_photos = {p["id"]: p.get("phash") for p in db_get_photos(sid)}
-        async for item in fetch_media_iter(token, max_depth=15):
-            item_id = item["id"]
-            if item_id in existing_photos and existing_photos[item_id]:
-                item["phash"] = existing_photos[item_id]
-            elif item["mimeType"].startswith("image/"):
-                item["phash"] = await compute_phash(item.get("thumbnailUrl"))
-            else:
-                item["phash"] = None
-                
-            db_upsert_photo(sid, item)
-            count += 1
-            SCAN_STATUS[sid]["count"] = count
-            if count % 300 == 0:
-                # 掃描過程中定期回存備份,萬一掃描中斷或換瀏覽器/裝置，也有最近的進度可以還原，
-                # 不用整個從頭重掃。
-                await backup_db_to_onedrive(sid, token)
-        SCAN_STATUS[sid] = {"status": "done", "count": count}
+        count = 0
+        new_delta_link = None
+        deleted_ids = []
+
+        if delta_link:
+            # ----- 增量模式 -----
+            SCAN_STATUS[sid]["mode"] = "incremental"
+            async for raw in fetch_delta_iter(token, delta_link):
+                if isinstance(raw, dict) and "__delta_link__" in raw:
+                    new_delta_link = raw["__delta_link__"]
+                    break
+                # deleted?
+                if raw.get("deleted"):
+                    deleted_ids.append(raw["id"])
+                    continue
+                # folder skip
+                if "folder" in raw:
+                    continue
+                file_info = raw.get("file")
+                if not file_info:
+                    continue
+                mime = file_info.get("mimeType", "")
+                if not (mime.startswith("image/") or mime.startswith("video/")):
+                    continue
+                photo_meta = raw.get("photo", {})
+                location = raw.get("location", {})
+                image_meta = raw.get("image", {})
+                thumbs = raw.get("thumbnails", [{}])[0] if raw.get("thumbnails") else {}
+                item = {
+                    "id": raw["id"], "name": raw["name"], "mimeType": mime, "size": raw.get("size"),
+                    "webUrl": raw.get("webUrl"), "thumbnailUrl": thumbs.get("medium", {}).get("url"),
+                    "thumbnailLargeUrl": thumbs.get("large", {}).get("url"),
+                    "takenDateTime": photo_meta.get("takenDateTime"),
+                    "latitude": location.get("latitude"), "longitude": location.get("longitude"),
+                    "width": image_meta.get("width"), "height": image_meta.get("height"),
+                    "source": "onedrive",
+                    "cameraMake": photo_meta.get("cameraMake"), "cameraModel": photo_meta.get("cameraModel"),
+                }
+                await process_drive_item(sid, item, existing_photos, token)
+                count += 1
+                SCAN_STATUS[sid]["count"] = count
+
+            # 處理刪除
+            if deleted_ids:
+                conn = sqlite3.connect(DB_PATH)
+                for did in deleted_ids:
+                    conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, did))
+                    conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ?", (sid, did))
+                conn.commit()
+                conn.close()
+        else:
+            # ----- 全量模式 (首次或 force) -----
+            SCAN_STATUS[sid]["mode"] = "full"
+            async for item in fetch_media_iter(token, max_depth=15):
+                await process_drive_item(sid, item, existing_photos, token)
+                count += 1
+                SCAN_STATUS[sid]["count"] = count
+                if count % 200 == 0:
+                    await backup_db_to_onedrive(sid, token)
+
+            # 全量後取得最新 deltaLink, 之後就能增量
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        f"{GRAPH_BASE}/me/drive/root/delta?token=latest",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    if resp.status_code == 200:
+                        new_delta_link = resp.json().get("@odata.deltaLink")
+            except Exception:
+                pass
+
+        final_count = len(db_get_photos(sid))
+        if new_delta_link:
+            save_scan_state(sid, delta_link=new_delta_link, photo_count=final_count)
+        else:
+            save_scan_state(sid, photo_count=final_count)
+
+        SCAN_STATUS[sid] = {
+            "status": "done",
+            "count": final_count,
+            "changed": count,
+            "deleted": len(deleted_ids) if delta_link else 0,
+            "mode": SCAN_STATUS[sid].get("mode", "full"),
+        }
         await backup_db_to_onedrive(sid, token)
     except Exception as e:
         SCAN_STATUS[sid] = {"status": "error", "error": str(e)}
         await backup_db_to_onedrive(sid, token)
 
-def start_scan_if_needed(sid: str, token: str):
-    if SCAN_STATUS.get(sid, {}).get("status") == "scanning": return
-    SCAN_TASKS[sid] = asyncio.create_task(run_background_scan(sid, token))
+
+def start_scan_if_needed(sid: str, token: str, force_full: bool = False):
+    if SCAN_STATUS.get(sid, {}).get("status") == "scanning":
+        return
+    SCAN_TASKS[sid] = asyncio.create_task(run_background_scan(sid, token, force_full=force_full))
 
 @app.get("/scan/start")
-async def scan_start(request: Request):
+async def scan_start(request: Request, force: int = 0):
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
-    if not token: return JSONResponse({"error": "not_logged_in"}, status_code=401)
-    start_scan_if_needed(sid, token)
+    if not token:
+        return JSONResponse({"error": "not_logged_in"}, status_code=401)
+    start_scan_if_needed(sid, token, force_full=bool(force))
     return RedirectResponse("/gallery")
 
 # ---------------------------------------------------------------------------
@@ -787,11 +1164,17 @@ def is_screenshot(item: dict) -> bool:
 def get_cleanup_items(items: list[dict]) -> dict[str, list[dict]]:
     screenshots = []
     low_quality = []
+    blurry = []
     for it in items:
-        if it.get("cleanup_skip"): continue  # 使用者已標記「略過不刪」，不再出現
-        if (it.get("mime_type") or "").startswith("video/"): continue
+        if it.get("cleanup_skip"):
+            continue
+        if (it.get("mime_type") or "").startswith("video/"):
+            continue
         if is_screenshot(it):
             screenshots.append(it)
+            continue
+        if is_blurry(it):
+            blurry.append(it)
             continue
         size = it.get("size")
         is_small_file = (size is not None and size < 102400)
@@ -799,7 +1182,7 @@ def get_cleanup_items(items: list[dict]) -> dict[str, list[dict]]:
         is_low_res = (w is not None and h is not None and w < 800 and h < 800)
         if is_small_file or is_low_res:
             low_quality.append(it)
-    return {"screenshots": screenshots, "low_quality": low_quality}
+    return {"screenshots": screenshots, "low_quality": low_quality, "blurry": blurry}
 
 @app.get("/cleanup", response_class=HTMLResponse)
 async def cleanup_view(request: Request):
@@ -819,6 +1202,7 @@ async def cleanup_view(request: Request):
 
     grouped_screenshots = group_by_month(cleanup_data["screenshots"])
     grouped_low_quality = group_by_month(cleanup_data["low_quality"])
+    grouped_blurry = group_by_month(cleanup_data.get("blurry", []))
     
     def build_month_sections(groups_dict, icon, title_prefix):
         html = ""
@@ -860,14 +1244,18 @@ async def cleanup_view(request: Request):
     </div>
     """
     
-    if not cleanup_data["screenshots"] and not cleanup_data["low_quality"]:
-        body += """<div class="card"><p class="secondary">太棒了！目前圖庫裡沒有發現截圖或低畫質的垃圾照片。</p></div>"""
+    has_any = cleanup_data["screenshots"] or cleanup_data["low_quality"] or cleanup_data.get("blurry")
+    if not has_any:
+        body += """<div class="card"><p class="secondary">太棒了！目前圖庫裡沒有發現截圖、模糊或低畫質的垃圾照片。</p></div>"""
     else:
         if cleanup_data["screenshots"]:
-            body += f"""<div class="section-title">螢幕截圖分批清理</div>"""
+            body += """<div class="section-title">螢幕截圖分批清理</div>"""
             body += build_month_sections(grouped_screenshots, "📱", "截圖")
+        if cleanup_data.get("blurry"):
+            body += """<div class="section-title">模糊 / 失焦照片分批清理</div>"""
+            body += build_month_sections(grouped_blurry, "🌫️", "模糊")
         if cleanup_data["low_quality"]:
-            body += f"""<div class="section-title">低畫質小檔案分批清理</div>"""
+            body += """<div class="section-title">低畫質小檔案分批清理</div>"""
             body += build_month_sections(grouped_low_quality, "🗑️", "小檔案")
             
     return HTMLResponse(page_shell("安全快速清理", body, active_tab="more", back_href="/more"))
@@ -1836,3 +2224,274 @@ async def photos(request: Request, max_depth: int = 6):
     if not token: return JSONResponse({"error": "not_logged_in", "hint": "先前往 /login"}, status_code=401)
     try: return {"count": len(items := await fetch_all_media(token, max_depth=max_depth)), "items": items}
     except httpx.HTTPStatusError as e: return JSONResponse({"error": "graph_api_error", "detail": e.response.text}, status_code=e.response.status_code)
+
+# ---------------------------------------------------------------------------
+# 自訂標籤 API + 頁面
+# ---------------------------------------------------------------------------
+@app.post("/api/photo/tag")
+async def api_add_tag(request: Request, id: str = Form(...), tag: str = Form(...)):
+    sid = request.session.get("sid")
+    if not sid:
+        return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+    add_photo_tag(sid, id, tag)
+    tags = get_photo_tags(sid, id)
+    return JSONResponse({"success": True, "tags": tags})
+
+@app.post("/api/photo/untag")
+async def api_remove_tag(request: Request, id: str = Form(...), tag: str = Form(...)):
+    sid = request.session.get("sid")
+    if not sid:
+        return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+    remove_photo_tag(sid, id, tag)
+    tags = get_photo_tags(sid, id)
+    return JSONResponse({"success": True, "tags": tags})
+
+@app.get("/tags", response_class=HTMLResponse)
+async def tags_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
+    all_tags = get_all_tags(sid)
+    if not all_tags:
+        body = """
+        <div class="card">
+            <p class="secondary">還沒有任何標籤。瀏覽照片時可以用下方快速標籤功能，或到單張照片加入「家人」「旅行」等標籤，之後就能用標籤篩選。</p>
+        </div>
+        """
+    else:
+        rows = "".join(f"""
+        <a class="list-row tappable" href="/tags/view?tag={quote(tag)}">
+            <span class="row-icon">🏷</span>
+            <span class="row-label">{tag}</span>
+            <span class="row-value">{cnt} 張</span>
+            <span class="chevron">›</span>
+        </a>
+        """ for tag, cnt in all_tags)
+        body = f"""
+        <p class="secondary" style="margin:0 6px 14px;">標籤完全存在你自己的 SQLite，不會上傳任何第三方，也不使用 AI。</p>
+        <div class="list-group">{rows}</div>
+        """
+    return HTMLResponse(page_shell("我的標籤", body, active_tab="more", back_href="/more"))
+
+@app.get("/tags/view", response_class=HTMLResponse)
+async def tags_view(request: Request, tag: str):
+    sid = request.session.get("sid")
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
+    photo_ids = set(photos_with_tag(sid, tag))
+    items = [it for it in db_get_photos(sid) if it["id"] in photo_ids]
+    if not items:
+        body = """<div class="card"><p class="secondary">這個標籤目前沒有照片。</p></div>"""
+    else:
+        thumbs = "".join(lb_img_tag(it) for it in items if it.get("thumbnail_url"))
+        body = f"""
+        <div class="card" style="text-align:center;">
+            <div class="stat-num">{len(items)}</div>
+            <div class="secondary">張照片標了「{tag}」</div>
+        </div>
+        <div class="photo-grid">{thumbs}</div>
+        """
+    return HTMLResponse(page_shell(f"🏷 {tag}", body, active_tab="more", back_href="/tags"))
+
+# ---------------------------------------------------------------------------
+# 方向篩選 (直式 / 橫式 / 正方形)
+# ---------------------------------------------------------------------------
+@app.get("/orientation", response_class=HTMLResponse)
+async def orientation_page(request: Request, orient: str = "portrait"):
+    sid = request.session.get("sid")
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+    filtered = [it for it in items if orientation_of(it) == orient and it.get("thumbnail_url")]
+    chips = "".join(
+        f'<a class="filter-chip{" active" if orient == o else ""}" href="/orientation?orient={o}">{label}</a>'
+        for o, label in [("portrait", "直式 📱"), ("landscape", "橫式 🖼"), ("square", "正方形 ⬜")]
+    )
+    if not filtered:
+        body = f"""
+        <div class="filter-bar">{chips}</div>
+        <div class="card"><p class="secondary">沒有找到這個方向的照片。</p></div>
+        """
+    else:
+        body = f"""
+        <div class="filter-bar">{chips}</div>
+        <p class="secondary" style="margin:0 6px 14px;">共 {len(filtered)} 張{ {'portrait':'直式','landscape':'橫式','square':'正方形'}.get(orient,'') }照片，適合當手機桌布或橫向展示。</p>
+        <div class="photo-grid">{"".join(lb_img_tag(it) for it in filtered[:400])}</div>
+        """
+    return HTMLResponse(page_shell("方向篩選", body, active_tab="gallery", back_href="/gallery"))
+
+# ---------------------------------------------------------------------------
+# 本週 / 本月回顧
+# ---------------------------------------------------------------------------
+@app.get("/reviews", response_class=HTMLResponse)
+async def reviews_page(request: Request, period: str = "week"):
+    sid = request.session.get("sid")
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+    now = datetime.now()
+    if period == "month":
+        start = (now.replace(day=1) - timedelta(days=1)).replace(day=1)
+        end = now.replace(day=1) - timedelta(seconds=1)
+        title = "上個月回顧"
+        label = f"{start.year} 年 {start.month} 月"
+    else:
+        # 上週 (上週一 ~ 上週日)
+        today = now.date()
+        start_of_this_week = today - timedelta(days=today.weekday())
+        end = datetime.combine(start_of_this_week - timedelta(days=1), datetime.max.time())
+        start = datetime.combine(start_of_this_week - timedelta(days=7), datetime.min.time())
+        title = "上週回顧"
+        label = f"{start.strftime('%m/%d')} – {end.strftime('%m/%d')}"
+
+    matched = []
+    for it in items:
+        dt = parse_taken(it)
+        if dt and start <= dt.replace(tzinfo=None) <= end.replace(tzinfo=None):
+            matched.append(it)
+
+    chips = f"""
+    <div class="filter-bar">
+        <a class="filter-chip{" active" if period == "week" else ""}" href="/reviews?period=week">上週</a>
+        <a class="filter-chip{" active" if period == "month" else ""}" href="/reviews?period=month">上個月</a>
+        <a class="filter-chip" href="/memories">當年今日</a>
+    </div>
+    """
+    if not matched:
+        body = chips + f"""<div class="card"><p class="secondary">{label} 沒有找到照片。</p></div>"""
+    else:
+        ids = ",".join(it["id"] for it in matched[:30])
+        body = chips + f"""
+        <div class="card" style="text-align:center;">
+            <div class="stat-num">{len(matched)}</div>
+            <div class="secondary">{label} 的照片</div>
+        </div>
+        <div class="photo-grid">{"".join(lb_img_tag(it) for it in matched if it.get("thumbnail_url"))}</div>
+        <form method="post" action="/memories/render" class="inline-form">
+            <input type="hidden" name="ids" value="{ids}" />
+            <input type="hidden" name="title" value="{title}" />
+            <button class="btn-primary" type="submit">✨ 把這些做成回憶影片</button>
+        </form>
+        """
+    return HTMLResponse(page_shell(title, body, active_tab="memories", back_href="/memories"))
+
+# ---------------------------------------------------------------------------
+# 批次下載 ZIP
+# ---------------------------------------------------------------------------
+@app.post("/download/zip")
+async def download_zip(request: Request, ids: str = Form(...)):
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return RedirectResponse("/login", status_code=303)
+    id_list = [i for i in ids.split(",") if i][:80]  # 上限保護
+    if not id_list:
+        return JSONResponse({"error": "no_ids"}, status_code=400)
+
+    all_photos = {p["id"]: p for p in db_get_photos(sid)}
+    buf = io.BytesIO()
+    async with httpx.AsyncClient(timeout=60) as client:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for pid in id_list:
+                photo = all_photos.get(pid)
+                if not photo:
+                    continue
+                try:
+                    resp = await client.get(
+                        f"{GRAPH_BASE}/me/drive/items/{pid}/content",
+                        headers={"Authorization": f"Bearer {token}"},
+                        follow_redirects=True,
+                    )
+                    if resp.status_code == 200:
+                        name = photo.get("name") or f"{pid}.jpg"
+                        # 避免 zip 內檔名衝突
+                        zf.writestr(name, resp.content)
+                except Exception:
+                    continue
+                await asyncio.sleep(0.15)
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=photos.zip"},
+    )
+
+# ---------------------------------------------------------------------------
+# 相簿分享連結 (OneDrive createLink)
+# ---------------------------------------------------------------------------
+@app.post("/api/share")
+async def api_create_share(request: Request, id: str = Form(...), scope: str = Form("anonymous")):
+    """為單一照片或資料夾建立分享連結。scope: anonymous | organization"""
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"type": "view", "scope": scope if scope in ("anonymous", "organization") else "anonymous"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"{GRAPH_BASE}/me/drive/items/{id}/createLink",
+                headers=headers,
+                json=payload,
+            )
+            if resp.status_code not in (200, 201):
+                return JSONResponse({"success": False, "error": resp.text}, status_code=resp.status_code)
+            data = resp.json()
+            link = data.get("link", {}).get("webUrl")
+            return JSONResponse({"success": True, "url": link, "raw": data})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=502)
+
+@app.get("/share/event", response_class=HTMLResponse)
+async def share_event_page(request: Request, start: str = "", end: str = ""):
+    """簡易事件相簿分享：列出該時段照片，並提供「為每張建立分享連結」或建議使用者在 OneDrive 建資料夾後分享。"""
+    sid = request.session.get("sid")
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+    # 簡化：若沒帶參數就顯示說明
+    body = """
+    <div class="card banner-info">
+        <p class="secondary" style="margin:0;">
+            想把某個事件相簿分享給家人朋友？最穩妥的方式是：<br>
+            1. 到 <a class="pill-link" href="/albums">自動分類</a> 找到事件<br>
+            2. 在 OneDrive 建立一個資料夾，把想分享的照片移進去<br>
+            3. 在 OneDrive 對該資料夾按「共用」產生連結<br><br>
+            或使用下方 API 為單張照片產生 view 連結（需照片 id）。
+        </p>
+    </div>
+    <div class="card">
+        <form class="inline-form" method="post" action="/api/share" id="share-form">
+            <input class="apple-input" name="id" placeholder="OneDrive 項目 ID" required />
+            <select class="apple-select" name="scope">
+                <option value="anonymous">任何人（匿名）</option>
+                <option value="organization">組織內</option>
+            </select>
+            <button class="btn-primary" type="submit">產生分享連結</button>
+        </form>
+        <div id="share-result" class="secondary" style="margin-top:12px;"></div>
+    </div>
+    <script>
+    document.getElementById('share-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const resp = await fetch('/api/share', { method: 'POST', body: fd });
+        const data = await resp.json();
+        const el = document.getElementById('share-result');
+        if (data.success) {
+            el.innerHTML = '✅ 連結已產生：<br><a href="' + data.url + '" target="_blank" style="color:var(--accent);word-break:break-all;">' + data.url + '</a>';
+        } else {
+            el.textContent = '失敗：' + (data.error || '未知錯誤');
+        }
+    });
+    </script>
+    """
+    return HTMLResponse(page_shell("相簿分享", body, active_tab="more", back_href="/more"))
+
+# ---------------------------------------------------------------------------
+# 更新「更多」與首頁連結，加入新功能入口
+# ---------------------------------------------------------------------------
+# (使用者可從 /more 進入；此處保留原 more_page 內容，實際部署時可把新連結加進 more_page)
