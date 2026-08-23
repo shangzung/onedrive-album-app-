@@ -999,19 +999,34 @@ async def restore_db_from_onedrive(sid: str, token: str | None, force: bool = Fa
         RESTORE_STATUS[sid] = result
         return result
 
+    # /content 常會 302 到 SharePoint 真正下載網址，必須 follow_redirects=True
     url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        async with httpx.AsyncClient(timeout=180) as client:
+        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code == 404:
                 result["message"] = "OneDrive 尚無備份檔（可能還沒掃過）"
                 RESTORE_STATUS[sid] = result
                 return result
+            # 少數環境仍回 302，再手動跟一次
+            if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
+                loc = resp.headers["location"]
+                # 轉到 sharepoint 下載網址時通常不需再帶 Graph Bearer
+                resp = await client.get(loc, timeout=180)
             resp.raise_for_status()
             raw = resp.content
 
+        if not raw:
+            result["message"] = "備份檔下載後是空的"
+            RESTORE_STATUS[sid] = result
+            return result
+
         rows = json.loads(raw)
+        if not isinstance(rows, list):
+            result["message"] = "備份檔格式不正確（應為 JSON 陣列）"
+            RESTORE_STATUS[sid] = result
+            return result
         if not rows:
             result["message"] = "備份檔是空的"
             RESTORE_STATUS[sid] = result
