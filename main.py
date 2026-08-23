@@ -1145,8 +1145,10 @@ async def restore_db_from_onedrive(sid: str, token: str | None, force: bool = Fa
         RESTORE_STATUS[sid] = result
         return result
 
-async def process_drive_item(sid: str, item: dict, existing_phash: dict, token: str | None = None) -> bool:
-    """處理單一 media item: 計算 phash / blur, upsert。回傳是否為新照片。"""
+async def process_drive_item(sid: str, item: dict, existing_phash: dict, token: str | None = None, compute_blur: bool = False) -> bool:
+    """處理單一 media item: 計算 phash, upsert。回傳是否為新照片。
+    blur 預設不在掃描時算（太慢，6000 張會讓 Render 掃不完），改到清理頁再算。
+    """
     item_id = item["id"]
     is_new = item_id not in existing_phash
     if item_id in existing_phash and existing_phash[item_id]:
@@ -1156,8 +1158,8 @@ async def process_drive_item(sid: str, item: dict, existing_phash: dict, token: 
     else:
         item["phash"] = None
 
-    # 模糊分數 (只用 thumbnail 快速估算, 有縮圖才算)
-    if (item.get("mimeType") or "").startswith("image/") and item.get("thumbnailUrl") and item.get("blur_score") is None:
+    # 僅在明確要求時才算模糊（掃描階段略過以加速）
+    if compute_blur and (item.get("mimeType") or "").startswith("image/") and item.get("thumbnailUrl") and item.get("blur_score") is None:
         try:
             async with httpx.AsyncClient(timeout=12) as client:
                 resp = await client.get(item["thumbnailUrl"])
@@ -1172,12 +1174,10 @@ async def process_drive_item(sid: str, item: dict, existing_phash: dict, token: 
     return is_new
 
 
-async def fetch_delta_iter(token: str, delta_link: str | None = None):
-    """使用 Graph delta query 取得變更 (新增/修改/刪除)。"""
+async def fetch_delta_iter(token: str, delta_link: str):
+    """使用 Graph delta query 取得變更。若 token 過期 (410) 會 yield {"__expired__": True}。"""
     headers = {"Authorization": f"Bearer {token}"}
-    url = delta_link or f"{GRAPH_BASE}/me/drive/root/delta?$expand=thumbnails&token=latest"
-    # 第一次若沒有 delta_link, 用 token=latest 拿最新 token (空結果), 再全量掃一次建立基線
-    # 實務上: 有 delta_link 就增量; 沒有就走全量 + 存 deltaLink
+    url = delta_link
 
     async with httpx.AsyncClient(timeout=45) as client:
         while url:
@@ -1186,8 +1186,8 @@ async def fetch_delta_iter(token: str, delta_link: str | None = None):
                 if resp.status_code == 429:
                     await asyncio.sleep(int(resp.headers.get("Retry-After", 5)))
                     continue
-                if resp.status_code == 410:  # delta token expired
-                    # 必須重新全量
+                if resp.status_code == 410:
+                    yield {"__expired__": True}
                     return
                 resp.raise_for_status()
                 break
@@ -1200,9 +1200,43 @@ async def fetch_delta_iter(token: str, delta_link: str | None = None):
                 return
 
 
+async def _scan_full(sid: str, token: str, existing_photos: dict) -> tuple[int, str | None]:
+    """全量掃描，回傳 (處理數, new_delta_link)。"""
+    count = 0
+    async for item in fetch_media_iter(token, max_depth=15):
+        is_new = await process_drive_item(sid, item, existing_photos, token, compute_blur=False)
+        if is_new:
+            existing_photos[item["id"]] = item.get("phash")
+        count += 1
+        total = len(existing_photos)
+        SCAN_STATUS[sid] = {
+            "status": "scanning",
+            "count": count,
+            "total_db": total,
+            "mode": "full",
+        }
+        if count % 100 == 0:
+            print(f"全量掃描進度 sid={sid} processed={count} db_unique={total}")
+        if count % 300 == 0:
+            await backup_db_to_onedrive(sid, token)
+
+    new_delta_link = None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{GRAPH_BASE}/me/drive/root/delta?token=latest",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                new_delta_link = resp.json().get("@odata.deltaLink")
+    except Exception:
+        pass
+    return count, new_delta_link
+
+
 async def run_background_scan(sid: str, token: str, force_full: bool = False):
-    """優先使用 delta 增量掃描; 沒有 delta_link 或 force_full 時才全量。"""
-    SCAN_STATUS[sid] = {"status": "scanning", "count": 0, "mode": "incremental"}
+    """優先 delta 增量；失敗/過期/force 則全量。"""
+    SCAN_STATUS[sid] = {"status": "scanning", "count": 0, "total_db": 0, "mode": "starting"}
     try:
         state = get_scan_state(sid)
         delta_link = None if force_full else state.get("delta_link")
@@ -1210,19 +1244,22 @@ async def run_background_scan(sid: str, token: str, force_full: bool = False):
         count = 0
         new_delta_link = None
         deleted_ids = []
+        mode = "full"
 
         if delta_link:
-            # ----- 增量模式 -----
+            mode = "incremental"
             SCAN_STATUS[sid]["mode"] = "incremental"
+            expired = False
             async for raw in fetch_delta_iter(token, delta_link):
+                if isinstance(raw, dict) and raw.get("__expired__"):
+                    expired = True
+                    break
                 if isinstance(raw, dict) and "__delta_link__" in raw:
                     new_delta_link = raw["__delta_link__"]
                     break
-                # deleted?
                 if raw.get("deleted"):
                     deleted_ids.append(raw["id"])
                     continue
-                # folder skip
                 if "folder" in raw:
                     continue
                 file_info = raw.get("file")
@@ -1245,39 +1282,32 @@ async def run_background_scan(sid: str, token: str, force_full: bool = False):
                     "source": "onedrive",
                     "cameraMake": photo_meta.get("cameraMake"), "cameraModel": photo_meta.get("cameraModel"),
                 }
-                await process_drive_item(sid, item, existing_photos, token)
+                is_new = await process_drive_item(sid, item, existing_photos, token, compute_blur=False)
+                if is_new:
+                    existing_photos[item["id"]] = item.get("phash")
                 count += 1
-                SCAN_STATUS[sid]["count"] = count
+                SCAN_STATUS[sid] = {
+                    "status": "scanning",
+                    "count": count,
+                    "total_db": len(existing_photos),
+                    "mode": "incremental",
+                }
 
-            # 處理刪除
-            if deleted_ids:
+            if expired:
+                print(f"delta 過期，改走全量掃描 sid={sid}")
+                mode = "full"
+                count, new_delta_link = await _scan_full(sid, token, existing_photos)
+            elif deleted_ids:
                 conn = sqlite3.connect(DB_PATH)
                 for did in deleted_ids:
                     conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, did))
                     conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ?", (sid, did))
+                    existing_photos.pop(did, None)
                 conn.commit()
                 conn.close()
         else:
-            # ----- 全量模式 (首次或 force) -----
-            SCAN_STATUS[sid]["mode"] = "full"
-            async for item in fetch_media_iter(token, max_depth=15):
-                await process_drive_item(sid, item, existing_photos, token)
-                count += 1
-                SCAN_STATUS[sid]["count"] = count
-                if count % 200 == 0:
-                    await backup_db_to_onedrive(sid, token)
-
-            # 全量後取得最新 deltaLink, 之後就能增量
-            try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.get(
-                        f"{GRAPH_BASE}/me/drive/root/delta?token=latest",
-                        headers={"Authorization": f"Bearer {token}"},
-                    )
-                    if resp.status_code == 200:
-                        new_delta_link = resp.json().get("@odata.deltaLink")
-            except Exception:
-                pass
+            mode = "full"
+            count, new_delta_link = await _scan_full(sid, token, existing_photos)
 
         final_count = len(db_get_photos(sid))
         if new_delta_link:
@@ -1288,13 +1318,16 @@ async def run_background_scan(sid: str, token: str, force_full: bool = False):
         SCAN_STATUS[sid] = {
             "status": "done",
             "count": final_count,
+            "total_db": final_count,
             "changed": count,
-            "deleted": len(deleted_ids) if delta_link else 0,
-            "mode": SCAN_STATUS[sid].get("mode", "full"),
+            "deleted": len(deleted_ids),
+            "mode": mode,
         }
+        print(f"掃描完成 sid={sid} mode={mode} processed={count} db={final_count}")
         await backup_db_to_onedrive(sid, token)
     except Exception as e:
         SCAN_STATUS[sid] = {"status": "error", "error": str(e)}
+        print(f"掃描失敗 sid={sid}: {e}")
         await backup_db_to_onedrive(sid, token)
 
 
@@ -2362,11 +2395,15 @@ def month_label(month_key: str) -> str:
         return month_key
 
 def render_gallery_html(items: list[dict], status: dict, visible_months: int, year_filter: str | None = None) -> str:
-    scan_state = status.get("status", "idle"); scanned_count = status.get("count", 0)
+    scan_state = status.get("status", "idle")
+    scanned_count = status.get("count", 0)
+    total_db = status.get("total_db") or len(items)
+    mode = status.get("mode", "")
     banners = ""
 
     if scan_state == "scanning":
-        banners += f"""<div class="card banner-warning">正在背景整理你的 OneDrive,目前已掃到 {scanned_count} 張……</div>"""
+        mode_label = "全量" if mode == "full" else "增量"
+        banners += f"""<div class="card banner-warning">正在{mode_label}整理 OneDrive：本輪已處理 {scanned_count} 項，資料庫共 {total_db} 張……</div>"""
     elif scan_state == "error":
         banners += f"""<div class="card banner-error">OneDrive 掃描時發生錯誤:{status.get("error")}</div>"""
     elif scan_state == "idle" and not items:
