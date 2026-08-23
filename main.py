@@ -615,7 +615,8 @@ async def get_ms_token(sid: str | None) -> str | None:
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     sid = request.session.get("sid")
-    onedrive_connected = bool(sid and TOKEN_STORE.get(sid, {}).get("access_token"))
+    token = await get_ms_token(sid) if sid else None
+    onedrive_connected = bool(token)
 
     if not onedrive_connected:
         body = """
@@ -629,15 +630,52 @@ async def home(request: Request):
         return HTMLResponse(page_shell("我的相簿", body, active_tab="home", show_tabbar=False))
 
     photo_count = len(db_get_photos(sid))
+
+    # 安全網：已登入但本地是空的 → 自動再試一次還原（Docker 重啟常見）
+    restore_banner = ""
+    if photo_count == 0:
+        rr = await restore_db_from_onedrive(sid, token)
+        photo_count = rr.get("count") or len(db_get_photos(sid))
+        if rr.get("ok") and photo_count > 0:
+            restore_banner = f"""
+            <div class="card banner-success">
+                <b>已從 OneDrive 還原 {photo_count} 張照片</b>
+                <p class="secondary" style="margin:6px 0 0;">容器重啟後本地資料會清空，已自動從雲端備份救回，無需重掃。</p>
+            </div>
+            """
+        elif rr.get("error") or (not rr.get("ok")):
+            msg = rr.get("message") or rr.get("error") or "未知錯誤"
+            restore_banner = f"""
+            <div class="card banner-error">
+                <b>雲端還原失敗</b>
+                <p class="secondary" style="margin:6px 0 0;">{msg}</p>
+                <p class="secondary" style="margin:6px 0 0;">請點下方「增量掃描」或「強制全量重新掃描」。OneDrive 備份檔若存在，也可到「更多」再試一次。</p>
+                <a class="btn-secondary" href="/restore">再試一次還原</a>
+            </div>
+            """
+    else:
+        # 顯示登入當下的還原提示（只顯示一次）
+        msg = request.session.pop("restore_msg", None)
+        ok = request.session.pop("restore_ok", None)
+        if msg and ok and (request.session.pop("restore_count", 0) or 0) > 0:
+            restore_banner = f"""
+            <div class="card banner-success"><b>{msg}</b></div>
+            """
+        elif msg and ok is False:
+            restore_banner = f"""
+            <div class="card banner-warning"><b>{msg}</b></div>
+            """
+
     scan_state = SCAN_STATUS.get(sid, {}).get("status", "idle")
     scan_hint = {
         "scanning": "背景整理中……",
         "error": "上次掃描發生錯誤,點一下重試",
-        "idle": "點一下開始整理 OneDrive",
+        "idle": "點一下開始整理 OneDrive" if photo_count == 0 else "增量更新",
         "done": "已是最新狀態",
     }.get(scan_state, "")
 
     body = f"""
+    {restore_banner}
     <div class="card" style="text-align:center;">
         <div class="stat-num">{photo_count}</div>
         <div class="secondary">張照片已整理</div>
@@ -654,8 +692,13 @@ async def home(request: Request):
     <div class="list-group">
         <a class="list-row tappable" href="/scan/start">
             <span class="row-icon">🔵</span>
-            <span class="row-label">OneDrive</span>
+            <span class="row-label">OneDrive 增量掃描</span>
             <span class="row-value">{scan_hint}</span>
+            <span class="chevron">›</span>
+        </a>
+        <a class="list-row tappable" href="/restore">
+            <span class="row-icon">☁️</span>
+            <span class="row-label">從 OneDrive 還原備份</span>
             <span class="chevron">›</span>
         </a>
     </div>
@@ -723,7 +766,11 @@ async def callback(request: Request, code: str | None = None, state: str | None 
         TOKEN_STORE.pop(old_sid, None)
 
     _store_ms_token(sid, result)
-    await restore_db_from_onedrive(sid, result["access_token"])
+    restore_result = await restore_db_from_onedrive(sid, result["access_token"])
+    # 把還原結果記在 session，首頁可以顯示一次提示
+    request.session["restore_msg"] = restore_result.get("message") or ""
+    request.session["restore_ok"] = bool(restore_result.get("ok"))
+    request.session["restore_count"] = int(restore_result.get("count") or 0)
     return RedirectResponse("/")
 
 @app.get("/logout")
@@ -732,6 +779,19 @@ async def logout(request: Request):
     if sid: TOKEN_STORE.pop(sid, None)
     request.session.clear()
     return RedirectResponse("/")
+
+@app.get("/restore")
+async def restore_page(request: Request):
+    """手動觸發從 OneDrive 還原備份（force=True，即使本地有資料也可覆蓋）。"""
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return RedirectResponse("/login", status_code=303)
+    rr = await restore_db_from_onedrive(sid, token, force=True)
+    request.session["restore_msg"] = rr.get("message") or ""
+    request.session["restore_ok"] = bool(rr.get("ok"))
+    request.session["restore_count"] = int(rr.get("count") or 0)
+    return RedirectResponse("/", status_code=303)
 
 # ---------------------------------------------------------------------------
 # OneDrive 掃描
@@ -836,19 +896,55 @@ def db_get_photos(sid: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 def db_restore_sid_rows(sid: str, rows: list[dict]):
+    """批次還原，兼容舊版備份缺欄位的情況。"""
     conn = sqlite3.connect(DB_PATH)
+    payload = []
     for r in rows:
-        conn.execute(
-            """
-            INSERT INTO photos (sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url, taken_date_time, latitude, longitude, phash, width, height, source, favorite, camera_make, camera_model)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(sid, id) DO UPDATE SET
-                name=excluded.name, mime_type=excluded.mime_type, size=excluded.size, web_url=excluded.web_url, thumbnail_url=excluded.thumbnail_url, thumbnail_large_url=excluded.thumbnail_large_url,
-                taken_date_time=excluded.taken_date_time, latitude=excluded.latitude, longitude=excluded.longitude, phash=excluded.phash, width=excluded.width, height=excluded.height, source=excluded.source,
-                favorite=excluded.favorite, camera_make=excluded.camera_make, camera_model=excluded.camera_model
-            """,
-            (sid, r.get("id"), r.get("name"), r.get("mime_type"), r.get("size"), r.get("web_url"), r.get("thumbnail_url"), r.get("thumbnail_large_url"), r.get("taken_date_time"), r.get("latitude"), r.get("longitude"), r.get("phash"), r.get("width"), r.get("height"), r.get("source", "onedrive"), r.get("favorite", 0), r.get("camera_make"), r.get("camera_model")),
-        )
+        if not r.get("id"):
+            continue
+        payload.append((
+            sid,
+            r.get("id"),
+            r.get("name"),
+            r.get("mime_type") or r.get("mimeType"),
+            r.get("size"),
+            r.get("web_url") or r.get("webUrl"),
+            r.get("thumbnail_url") or r.get("thumbnailUrl"),
+            r.get("thumbnail_large_url") or r.get("thumbnailLargeUrl"),
+            r.get("taken_date_time") or r.get("takenDateTime"),
+            r.get("latitude"),
+            r.get("longitude"),
+            r.get("phash"),
+            r.get("width"),
+            r.get("height"),
+            r.get("source", "onedrive"),
+            r.get("favorite", 0) or 0,
+            r.get("camera_make") or r.get("cameraMake"),
+            r.get("camera_model") or r.get("cameraModel"),
+            r.get("blur_score"),
+            r.get("cleanup_skip", 0) or 0,
+        ))
+    conn.executemany(
+        """
+        INSERT INTO photos (
+            sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url,
+            taken_date_time, latitude, longitude, phash, width, height, source,
+            favorite, camera_make, camera_model, blur_score, cleanup_skip
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sid, id) DO UPDATE SET
+            name=excluded.name, mime_type=excluded.mime_type, size=excluded.size,
+            web_url=excluded.web_url, thumbnail_url=excluded.thumbnail_url,
+            thumbnail_large_url=excluded.thumbnail_large_url,
+            taken_date_time=excluded.taken_date_time, latitude=excluded.latitude,
+            longitude=excluded.longitude, phash=COALESCE(excluded.phash, photos.phash),
+            width=excluded.width, height=excluded.height, source=excluded.source,
+            favorite=excluded.favorite, camera_make=excluded.camera_make,
+            camera_model=excluded.camera_model,
+            blur_score=COALESCE(excluded.blur_score, photos.blur_score),
+            cleanup_skip=excluded.cleanup_skip
+        """,
+        payload,
+    )
     conn.commit()
     conn.close()
 
@@ -859,33 +955,82 @@ def db_restore_sid_rows(sid: str, rows: list[dict]):
 BACKUP_FOLDER_NAME = "MyAlbumApp_Backup"
 BACKUP_FILENAME = "photos_backup.json"
 
+# 還原結果快取（給首頁顯示用，避免使用者完全不知道發生什麼事）
+RESTORE_STATUS: dict[str, dict] = {}
+
 async def backup_db_to_onedrive(sid: str, token: str | None):
-    if not token: return
+    if not token:
+        return
     rows = db_get_photos(sid)
-    if not rows: return
+    if not rows:
+        return
     url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.put(url, headers=headers, content=json.dumps(rows, ensure_ascii=False).encode("utf-8"))
+        # 6000+ 張備份可能較大，給足時間
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.put(
+                url,
+                headers=headers,
+                content=json.dumps(rows, ensure_ascii=False).encode("utf-8"),
+            )
             resp.raise_for_status()
+        print(f"備份成功 sid={sid} count={len(rows)}")
     except Exception as e:
         print(f"備份 photos.db 到 OneDrive 失敗(sid={sid}): {e}")
 
-async def restore_db_from_onedrive(sid: str, token: str | None):
-    if not token: return
-    if db_get_photos(sid): return  # 本機已經有資料,不用還原,避免蓋掉更新的資料
+async def restore_db_from_onedrive(sid: str, token: str | None, force: bool = False) -> dict:
+    """
+    從 OneDrive 還原 photos_backup.json。
+    回傳 {"ok": bool, "count": int, "message": str, "error": str|None}
+    """
+    result = {"ok": False, "count": 0, "message": "", "error": None}
+    if not token:
+        result["error"] = "no_token"
+        result["message"] = "沒有登入 token，無法還原"
+        RESTORE_STATUS[sid] = result
+        return result
+
+    local_count = len(db_get_photos(sid))
+    if local_count > 0 and not force:
+        result["ok"] = True
+        result["count"] = local_count
+        result["message"] = f"本機已有 {local_count} 張，略過還原"
+        RESTORE_STATUS[sid] = result
+        return result
+
     url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             resp = await client.get(url, headers=headers)
-            if resp.status_code == 404: return  # 使用者還沒備份過,略過即可
+            if resp.status_code == 404:
+                result["message"] = "OneDrive 尚無備份檔（可能還沒掃過）"
+                RESTORE_STATUS[sid] = result
+                return result
             resp.raise_for_status()
-        rows = json.loads(resp.content)
-        if rows: db_restore_sid_rows(sid, rows)
+            raw = resp.content
+
+        rows = json.loads(raw)
+        if not rows:
+            result["message"] = "備份檔是空的"
+            RESTORE_STATUS[sid] = result
+            return result
+
+        db_restore_sid_rows(sid, rows)
+        final = len(db_get_photos(sid))
+        result["ok"] = True
+        result["count"] = final
+        result["message"] = f"已從 OneDrive 還原 {final} 張照片"
+        print(f"還原成功 sid={sid} count={final}")
+        RESTORE_STATUS[sid] = result
+        return result
     except Exception as e:
+        result["error"] = str(e)
+        result["message"] = f"還原失敗：{e}"
         print(f"從 OneDrive 還原 photos.db 失敗(sid={sid}): {e}")
+        RESTORE_STATUS[sid] = result
+        return result
 
 async def process_drive_item(sid: str, item: dict, existing_phash: dict, token: str | None = None) -> bool:
     """處理單一 media item: 計算 phash / blur, upsert。回傳是否為新照片。"""
@@ -1856,36 +2001,103 @@ def build_xfade_video(image_paths: list[str], output_path: str, seconds_per_phot
     if result.returncode != 0: raise RuntimeError(f"ffmpeg 執行失敗: {result.stderr[-2000:]}")
 
 async def download_full_image(client: httpx.AsyncClient, token: str, item_id: str) -> bytes | None:
+    """優先用 Graph downloadUrl（預簽章、較穩），失敗再退回 /content。"""
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        resp = await client.get(f"{GRAPH_BASE}/me/drive/items/{item_id}/content", headers={"Authorization": f"Bearer {token}"}, timeout=30, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
-    except Exception: return None
+        # 1) 先取 metadata 裡的 @microsoft.graph.downloadUrl
+        meta = await client.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}?$select=id,@microsoft.graph.downloadUrl",
+            headers=headers,
+            timeout=20,
+        )
+        if meta.status_code == 200:
+            download_url = meta.json().get("@microsoft.graph.downloadUrl")
+            if download_url:
+                # downloadUrl 本身已帶授權，不要再帶 Bearer
+                resp = await client.get(download_url, timeout=60, follow_redirects=True)
+                if resp.status_code == 200 and resp.content:
+                    return resp.content
+        # 2) 退回 /content
+        resp = await client.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
+            headers=headers,
+            timeout=60,
+            follow_redirects=True,
+        )
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception as e:
+        print(f"download_full_image failed id={item_id}: {e}")
+    return None
 
 async def get_full_image_bytes(client: httpx.AsyncClient, item: dict, token: str | None) -> bytes | None:
-    if not token: return None
-    return await download_full_image(client, token, item["id"])
+    """原圖 → 大縮圖 URL → 中縮圖 URL，盡量拿到可用的圖。"""
+    if token:
+        raw = await download_full_image(client, token, item["id"])
+        if raw:
+            return raw
+    # 縮圖 fallback（回憶影片品質會差一點，但至少能產出）
+    for key in ("thumbnail_large_url", "thumbnailLargeUrl", "thumbnail_url", "thumbnailUrl"):
+        url = item.get(key)
+        if not url:
+            continue
+        try:
+            resp = await client.get(url, timeout=30, follow_redirects=True)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+        except Exception:
+            continue
+    return None
 
-async def render_memory_video(job_id: str, items: list[dict], token: str | None, music_path: str | None, title: str):
-    MEMORY_JOBS[job_id] = {"status": "rendering", "progress": 0, "total": len(items), "title": title}
-    tmp_dir = os.path.join(RENDER_DIR, job_id); os.makedirs(tmp_dir, exist_ok=True)
+async def render_memory_video(job_id: str, items: list[dict], token: str | None, music_path: str | None, title: str, sid: str | None = None):
+    MEMORY_JOBS[job_id] = {"status": "rendering", "progress": 0, "total": len(items), "title": title, "failed": 0}
+    tmp_dir = os.path.join(RENDER_DIR, job_id)
+    os.makedirs(tmp_dir, exist_ok=True)
     try:
+        # 背景任務執行較久，中途刷新一次 token
+        if sid:
+            fresh = await get_ms_token(sid)
+            if fresh:
+                token = fresh
+
         frame_paths = []
+        failed = 0
         async with httpx.AsyncClient() as client:
             for idx, item in enumerate(items):
-                if not (raw := await get_full_image_bytes(client, item, token)): continue
-                try: frame = prepare_frame(raw, (1280, 720))
-                except Exception: continue
+                raw = await get_full_image_bytes(client, item, token)
+                if not raw:
+                    failed += 1
+                    MEMORY_JOBS[job_id]["failed"] = failed
+                    MEMORY_JOBS[job_id]["progress"] = idx + 1
+                    continue
+                try:
+                    frame = prepare_frame(raw, (1280, 720))
+                except Exception:
+                    failed += 1
+                    MEMORY_JOBS[job_id]["failed"] = failed
+                    MEMORY_JOBS[job_id]["progress"] = idx + 1
+                    continue
                 frame_path = os.path.join(tmp_dir, f"{idx:03d}.jpg")
                 frame.save(frame_path, "JPEG", quality=90)
-                frame_paths.append(frame_path); MEMORY_JOBS[job_id]["progress"] = idx + 1
-        if len(frame_paths) < 2: raise ValueError("可下載到的照片不足兩張,無法產生回憶影片")
+                frame_paths.append(frame_path)
+                MEMORY_JOBS[job_id]["progress"] = idx + 1
+
+        if len(frame_paths) < 2:
+            raise ValueError(
+                f"可下載到的照片不足兩張（成功 {len(frame_paths)}、失敗 {failed}）。"
+                "可能原因：登入已過期、檔案已從 OneDrive 刪除、或網路被擋。"
+                "請重新登入後再試一次。"
+            )
         output_path = os.path.join(RENDER_DIR, f"{job_id}.mp4")
-        await asyncio.to_thread(build_xfade_video, frame_paths, output_path, seconds_per_photo=3.0, transition_seconds=1.0, audio_path=music_path)
+        await asyncio.to_thread(
+            build_xfade_video, frame_paths, output_path,
+            seconds_per_photo=3.0, transition_seconds=1.0, audio_path=music_path,
+        )
         MEMORY_JOBS[job_id] = {"status": "done", "video_path": output_path, "title": title}
     except Exception as e:
         MEMORY_JOBS[job_id] = {"status": "error", "error": str(e), "title": title}
-    finally: shutil.rmtree(tmp_dir, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def render_memories_html(items: list[dict]) -> str:
     today_groups = photos_on_this_day(items); events = [e for e in cluster_events(items) if len(e["items"]) >= 4][:6]; music_files = list_music_files()
@@ -1957,9 +2169,12 @@ async def memories_render(request: Request):
     if len(items) < 2: return JSONResponse({"error": "photos_not_found"}, status_code=400)
     music = form.get("music"); music_path = os.path.join(MUSIC_DIR, str(music)) if music else None
     if music_path and not os.path.isfile(music_path): music_path = None
-    job_id = str(uuid.uuid4()); title = str(form.get("title", "回憶影片"))
+    if not token:
+        return RedirectResponse("/login", status_code=303)
+    job_id = str(uuid.uuid4())
+    title = str(form.get("title", "回憶影片"))
     MEMORY_JOBS[job_id] = {"status": "pending", "title": title}
-    asyncio.create_task(render_memory_video(job_id, items, token, music_path, title))
+    asyncio.create_task(render_memory_video(job_id, items, token, music_path, title, sid=sid))
     return RedirectResponse(f"/memories/status/{job_id}", status_code=303)
 
 @app.get("/memories/status/{job_id}", response_class=HTMLResponse)
