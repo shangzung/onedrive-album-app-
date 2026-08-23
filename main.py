@@ -1,6 +1,6 @@
 """
 我的相簿 App - MVP 後端
-(OneDrive 背景掃描 + Google 相簿 Library API 日期區間全自動匯入 + SQLite 快取 + pHash 重複照片偵測與自動刪除
+(OneDrive 背景掃描 + SQLite 快取 + pHash 重複照片偵測與自動刪除
  + 自動分類 + 回憶影片 + 安全快速清理(按月分組+移動至雲端垃圾桶) + Apple 風格手機版 UI)
 """
 
@@ -15,7 +15,6 @@ import subprocess
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
 
 import httpx
 import imagehash
@@ -23,7 +22,6 @@ import msal
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -42,32 +40,17 @@ AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["Files.ReadWrite.All", "User.Read"]
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# ---------------------------------------------------------------------------
-# Google 相簿(Library API)設定(選填)
-# ---------------------------------------------------------------------------
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/google/callback")
-GOOGLE_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
-
-GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_LIBRARY_API = "https://photoslibrary.googleapis.com/v1"
-GOOGLE_SCOPE = "https://www.googleapis.com/auth/photoslibrary.readonly"
-
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "photos.db")
 RENDER_DIR = os.path.join(BASE_DIR, "renders")
 MUSIC_DIR = os.path.join(BASE_DIR, "music")
-MEDIA_DIR = os.path.join(BASE_DIR, "media_cache")
-GOOGLE_MEDIA_DIR = os.path.join(MEDIA_DIR, "google")
 os.makedirs(RENDER_DIR, exist_ok=True)
 os.makedirs(MUSIC_DIR, exist_ok=True)
-os.makedirs(GOOGLE_MEDIA_DIR, exist_ok=True)
 
 DEFAULT_DUP_THRESHOLD = 5
 DEFAULT_EVENT_GAP_HOURS = 48
 LOCATION_PRECISION = 2
+GALLERY_MONTHS_PER_PAGE = 6
 
 # ---------------------------------------------------------------------------
 # Apple 風格共用 UI
@@ -240,7 +223,6 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
     full = item.get("thumbnail_large_url") or item.get("thumbnailLargeUrl") or item.get("web_url") or item.get("webUrl") or thumb
     name = (item.get("name") or "").replace('"', "&quot;")
     taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
-    if badge is None: badge = "G" if item.get("source") == "google" else ""
     badge_html = f'<div class="photo-badge">{badge}</div>' if badge else ""
     return f"""
     <div class="photo-tile">
@@ -251,13 +233,11 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
 
 app = FastAPI(title="我的相簿 App")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
-app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 
 TOKEN_STORE: dict[str, dict] = {}
 SCAN_STATUS: dict[str, dict] = {}
 SCAN_TASKS: dict[str, asyncio.Task] = {}
 MEMORY_JOBS: dict[str, dict] = {}
-GOOGLE_IMPORT_STATUS: dict[str, dict] = {}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -272,6 +252,8 @@ def init_db():
             conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {col_type}")
         except sqlite3.OperationalError:
             pass
+    # 不再支援 Google 相簿,清掉舊的 Google 來源紀錄(縮圖快取在本機硬碟,早已不可靠)。
+    conn.execute("DELETE FROM photos WHERE source = 'google'")
     conn.commit()
     conn.close()
 
@@ -287,14 +269,6 @@ def _store_ms_token(sid: str, result: dict):
         TOKEN_STORE[sid]["refresh_token"] = result["refresh_token"]
     expires_in = result.get("expires_in", 3600)
     TOKEN_STORE[sid]["expires_at"] = datetime.utcnow() + timedelta(seconds=int(expires_in) - 120)
-
-def _store_google_token(sid: str, data: dict):
-    TOKEN_STORE.setdefault(sid, {})
-    TOKEN_STORE[sid]["google_access_token"] = data["access_token"]
-    if data.get("refresh_token"):
-        TOKEN_STORE[sid]["google_refresh_token"] = data["refresh_token"]
-    expires_in = data.get("expires_in", 3600)
-    TOKEN_STORE[sid]["google_expires_at"] = datetime.utcnow() + timedelta(seconds=int(expires_in) - 120)
 
 async def get_ms_token(sid: str | None) -> str | None:
     """回傳有效的 OneDrive access_token,過期前 2 分鐘自動用 refresh_token 換新。"""
@@ -313,28 +287,6 @@ async def get_ms_token(sid: str | None) -> str | None:
     _store_ms_token(sid, result)
     return result["access_token"]
 
-async def get_google_token(sid: str | None) -> str | None:
-    """回傳有效的 Google access_token,過期前 2 分鐘自動用 refresh_token 換新。"""
-    if not sid or sid not in TOKEN_STORE:
-        return None
-    entry = TOKEN_STORE[sid]
-    if entry.get("google_access_token") and entry.get("google_expires_at") and datetime.utcnow() < entry["google_expires_at"]:
-        return entry["google_access_token"]
-    refresh_token = entry.get("google_refresh_token")
-    if not refresh_token:
-        return entry.get("google_access_token")
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(GOOGLE_TOKEN_URL, data={
-            "client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
-            "refresh_token": refresh_token, "grant_type": "refresh_token",
-        })
-    data = resp.json()
-    if "access_token" not in data:
-        entry.pop("google_access_token", None)
-        return None
-    _store_google_token(sid, data)
-    return data["access_token"]
-
 # ---------------------------------------------------------------------------
 # 首頁 / 更多頁
 # ---------------------------------------------------------------------------
@@ -342,41 +294,27 @@ async def get_google_token(sid: str | None) -> str | None:
 async def home(request: Request):
     sid = request.session.get("sid")
     onedrive_connected = bool(sid and TOKEN_STORE.get(sid, {}).get("access_token"))
-    google_connected = bool(sid and TOKEN_STORE.get(sid, {}).get("google_access_token"))
 
     if not onedrive_connected:
         body = """
         <div class="hero">
             <div class="hero-icon">📸</div>
             <h1>我的相簿</h1>
-            <p class="secondary">整理 OneDrive、連結 Google 相簿,一站管理所有照片</p>
+            <p class="secondary">專心整理你的 OneDrive 照片</p>
         </div>
         <a class="btn-primary" href="/login">用 Microsoft 帳號登入</a>
         """
         return HTMLResponse(page_shell("我的相簿", body, active_tab="home", show_tabbar=False))
 
     photo_count = len(db_get_photos(sid))
-    
-    if google_connected:
-        google_row = """
-        <a class="list-row tappable" href="/google/sync/options">
-            <span class="row-icon">🟢</span>
-            <span class="row-label">Google 相簿</span>
-            <span class="row-value">已連結・同步設定</span>
-            <span class="chevron">›</span>
-        </a>
-        """
-    else:
-        status_text = "尚未連結" if GOOGLE_ENABLED else "尚未設定"
-        google_row = f"""
-        <a class="list-row tappable" href="/google/login">
-            <span class="row-icon">⚪️</span>
-            <span class="row-label">Google 相簿</span>
-            <span class="row-value">{status_text}</span>
-            <span class="chevron">›</span>
-        </a>
-        """
-    
+    scan_state = SCAN_STATUS.get(sid, {}).get("status", "idle")
+    scan_hint = {
+        "scanning": "背景整理中……",
+        "error": "上次掃描發生錯誤,點一下重試",
+        "idle": "點一下開始整理 OneDrive",
+        "done": "已是最新狀態",
+    }.get(scan_state, "")
+
     body = f"""
     <div class="card" style="text-align:center;">
         <div class="stat-num">{photo_count}</div>
@@ -388,11 +326,16 @@ async def home(request: Request):
         <a class="list-row tappable" href="/albums"><span class="row-icon">🗂</span><span class="row-label">自動分類</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/memories"><span class="row-icon">✨</span><span class="row-label">回憶影片</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/duplicates/view"><span class="row-icon">🧬</span><span class="row-label">疑似重複照片</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/cleanup"><span class="row-icon">🧹</span><span class="row-label">快速清理</span><span class="chevron">›</span></a>
     </div>
-    <div class="section-title">帳號連結</div>
+    <div class="section-title">帳號</div>
     <div class="list-group">
-        <div class="list-row"><span class="row-icon">🔵</span><span class="row-label">OneDrive</span><span class="row-value">已連結</span></div>
-        {google_row}
+        <a class="list-row tappable" href="/scan/start">
+            <span class="row-icon">🔵</span>
+            <span class="row-label">OneDrive</span>
+            <span class="row-value">{scan_hint}</span>
+            <span class="chevron">›</span>
+        </a>
     </div>
     <div class="list-group">
         <a class="list-row tappable danger" href="/logout"><span class="row-icon">🚪</span><span class="row-label">登出</span></a>
@@ -404,43 +347,13 @@ async def home(request: Request):
 async def more_page(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login", status_code=303)
-    
-    google_connected = bool(TOKEN_STORE.get(sid, {}).get("google_access_token"))
-    
-    if google_connected:
-        google_row = """
-        <a class="list-row tappable" href="/google/sync/options">
-            <span class="row-icon">🟢</span>
-            <span class="row-label">從 Google 相簿自動同步</span>
-            <span class="chevron">›</span>
-        </a>
-        """
-    else:
-        status_text = "" if GOOGLE_ENABLED else "尚未設定"
-        google_row = f"""
-        <a class="list-row tappable" href="/google/login">
-            <span class="row-icon">⚪️</span>
-            <span class="row-label">連結 Google 相簿</span>
-            <span class="row-value">{status_text}</span>
-            <span class="chevron">›</span>
-        </a>
-        """
-        
-    google_hint = "" if GOOGLE_ENABLED else """
-    <p class="secondary" style="margin:0 6px 14px;">尚未設定 Google API 憑證,請參考程式檔案最上方的說明設定 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET 後再連結。</p>
-    """
-    
-    body = f"""
+
+    body = """
     <div class="list-group">
         <a class="list-row tappable" href="/duplicates/view"><span class="row-icon">🧬</span><span class="row-label">疑似重複照片</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/cleanup"><span class="row-icon">🧹</span><span class="row-label">快速清理(安全緩衝模式)</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/scan/start"><span class="row-icon">🔄</span><span class="row-label">重新掃描 OneDrive</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/photos?max_depth=0"><span class="row-icon">🧾</span><span class="row-label">原始照片清單(JSON)</span><span class="chevron">›</span></a>
-    </div>
-    <div class="section-title">Google 相簿</div>
-    {google_hint}
-    <div class="list-group">
-        {google_row}
     </div>
     <div class="list-group">
         <a class="list-row tappable danger" href="/logout"><span class="row-icon">🚪</span><span class="row-label">登出</span></a>
@@ -485,200 +398,6 @@ async def logout(request: Request):
     if sid: TOKEN_STORE.pop(sid, None)
     request.session.clear()
     return RedirectResponse("/")
-
-# ---------------------------------------------------------------------------
-# Google 相簿與 OneDrive 上傳機制
-# ---------------------------------------------------------------------------
-async def upload_to_onedrive(client: httpx.AsyncClient, token: str, filename: str, content: bytes) -> str | None:
-    url = f"{GRAPH_BASE}/me/drive/root:/GooglePhotosImport/{filename}:/content"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/octet-stream"
-    }
-    try:
-        resp = await client.put(url, headers=headers, content=content, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("id")
-    except Exception as e:
-        print(f"上傳 {filename} 到 OneDrive 失敗: {e}")
-        return None
-
-@app.get("/google/login")
-async def google_login(request: Request):
-    if not GOOGLE_ENABLED: 
-        return HTMLResponse(page_shell("錯誤", "<div class='card banner-error'><p class='secondary'>尚未設定 Google API 憑證，請檢查 .env 檔案中的 GOOGLE_CLIENT_ID 與 GOOGLE_CLIENT_SECRET。</p></div>", active_tab="more", back_href="/more"), status_code=400)
-    
-    sid = request.session.get("sid") or str(uuid.uuid4())
-    request.session["sid"] = sid; state = str(uuid.uuid4()); request.session["google_state"] = state
-    params = {"client_id": GOOGLE_CLIENT_ID, "redirect_uri": GOOGLE_REDIRECT_URI, "response_type": "code", "scope": GOOGLE_SCOPE, "access_type": "offline", "prompt": "consent", "state": state}
-    return RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
-
-@app.get("/google/callback")
-async def google_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
-    if error: return JSONResponse({"error": error}, status_code=400)
-    if not code or state != request.session.get("google_state"): return JSONResponse({"error": "invalid_state_or_missing_code"}, status_code=400)
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(GOOGLE_TOKEN_URL, data={"code": code, "client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "redirect_uri": GOOGLE_REDIRECT_URI, "grant_type": "authorization_code"})
-    data = resp.json()
-    if "access_token" not in data: return JSONResponse({"error": data.get("error"), "description": data.get("error_description")}, status_code=400)
-    
-    sid = request.session.get("sid")
-    if not sid: return JSONResponse({"error": "missing_session"}, status_code=400)
-    _store_google_token(sid, data)
-    return RedirectResponse("/google/sync/options")
-
-@app.get("/google/sync/options", response_class=HTMLResponse)
-async def google_sync_options(request: Request):
-    sid = request.session.get("sid")
-    token = await get_google_token(sid)
-    if not token: return RedirectResponse("/google/login")
-    
-    current_year = datetime.now().year
-    default_start = f"{current_year}-01-01"
-    default_end = f"{current_year}-12-31"
-
-    body = f"""
-    <div class="card">
-        <h2 style="margin-top:0;">自動同步設定</h2>
-        <p class="secondary">請設定要從 Google 相簿抓取的日期區間，防止大量資料拖垮系統。留空代表同步所有照片（不建議）。</p>
-        <form method="post" action="/google/sync/start">
-            <div style="margin-bottom: 12px;">
-                <label class="section-title" style="margin-left: 0;">起始日期</label>
-                <input class="apple-input" type="date" name="start_date" value="{default_start}">
-            </div>
-            <div style="margin-bottom: 12px;">
-                <label class="section-title" style="margin-left: 0;">結束日期</label>
-                <input class="apple-input" type="date" name="end_date" value="{default_end}">
-            </div>
-            <button class="btn-primary" type="submit" style="margin-top:20px;">開始背景同步</button>
-        </form>
-    </div>
-    """
-    return page_shell("設定 Google 同步", body, active_tab="more", back_href="/more")
-
-@app.post("/google/sync/start")
-async def google_sync_start(request: Request, start_date: str = Form(""), end_date: str = Form("")):
-    sid = request.session.get("sid")
-    google_token = await get_google_token(sid)
-    onedrive_token = await get_ms_token(sid)
-    if not google_token: return RedirectResponse("/google/login", status_code=303)
-
-    GOOGLE_IMPORT_STATUS[sid] = {"status": "importing", "count": 0, "total": "計算中..."}
-    asyncio.create_task(run_google_auto_import(sid, google_token, onedrive_token, start_date, end_date))
-    return RedirectResponse("/gallery", status_code=303)
-
-def google_media_fs_path(url_path: str) -> str:
-    prefix = "/media/"
-    if url_path.startswith(prefix): return os.path.join(MEDIA_DIR, url_path[len(prefix):])
-    return url_path
-
-async def import_one_google_item(client: httpx.AsyncClient, sid: str, google_token: str, onedrive_token: str, media_item: dict):
-    mi_id = media_item.get("id")
-    base_url = media_item.get("baseUrl")
-    if not mi_id or not base_url: return
-
-    mime = media_item.get("mimeType", "image/jpeg")
-    filename = media_item.get("filename", f"{mi_id}.jpg")
-    meta = media_item.get("mediaMetadata", {})
-    width = meta.get("width")
-    height = meta.get("height")
-    taken = meta.get("creationTime")
-
-    user_dir = os.path.join(GOOGLE_MEDIA_DIR, sid)
-    os.makedirs(user_dir, exist_ok=True)
-    thumb_fs_path = os.path.join(user_dir, f"{mi_id}_thumb.jpg")
-    large_fs_path = os.path.join(user_dir, f"{mi_id}_large.jpg")
-    headers = {"Authorization": f"Bearer {google_token}"}
-
-    thumb_resp = await client.get(f"{base_url}=w480-h480-c", headers=headers, timeout=30)
-    if thumb_resp.status_code == 200:
-        with open(thumb_fs_path, "wb") as f: f.write(thumb_resp.content)
-    try:
-        large_resp = await client.get(f"{base_url}=w1600", headers=headers, timeout=30)
-        large_resp.raise_for_status()
-        with open(large_fs_path, "wb") as f: f.write(large_resp.content)
-    except Exception:
-        if os.path.exists(thumb_fs_path): shutil.copyfile(thumb_fs_path, large_fs_path)
-
-    phash = None
-    try:
-        img = Image.open(thumb_fs_path).convert("RGB")
-        phash = str(imagehash.phash(img))
-    except Exception:
-        pass
-
-    download_param = "=dv" if mime.startswith("video/") else "=d"
-    file_bytes = None
-    try:
-        orig_resp = await client.get(f"{base_url}{download_param}", headers=headers, timeout=60, follow_redirects=True)
-        orig_resp.raise_for_status()
-        file_bytes = orig_resp.content
-    except Exception:
-        pass
-
-    new_onedrive_id = None
-    if onedrive_token and file_bytes:
-        new_onedrive_id = await upload_to_onedrive(client, onedrive_token, filename, file_bytes)
-
-    if new_onedrive_id:
-        item = {
-            "id": new_onedrive_id, "name": filename, "mimeType": mime, "size": len(file_bytes) if file_bytes else None,
-            "webUrl": None, "thumbnailUrl": f"/media/google/{sid}/{mi_id}_thumb.jpg",
-            "thumbnailLargeUrl": f"/media/google/{sid}/{mi_id}_large.jpg", "takenDateTime": taken,
-            "latitude": None, "longitude": None, "width": width, "height": height, "phash": phash, "source": "onedrive", 
-        }
-    else:
-        item = {
-            "id": f"google:{mi_id}", "name": filename, "mimeType": mime, "size": None, "webUrl": None,
-            "thumbnailUrl": f"/media/google/{sid}/{mi_id}_thumb.jpg", "thumbnailLargeUrl": f"/media/google/{sid}/{mi_id}_large.jpg",
-            "takenDateTime": taken, "latitude": None, "longitude": None, "width": width, "height": height, "phash": phash, "source": "google",
-        }
-    db_upsert_photo(sid, item)
-
-async def run_google_auto_import(sid: str, google_token: str, onedrive_token: str, start_dt: str = "", end_dt: str = ""):
-    try:
-        media_items: list[dict] = []
-        page_token = None
-        req_body = {"pageSize": 100}
-        if start_dt and end_dt:
-            try:
-                s_year, s_month, s_day = map(int, start_dt.split("-"))
-                e_year, e_month, e_day = map(int, end_dt.split("-"))
-                req_body["filters"] = {"dateFilter": {"ranges": [{"startDate": {"year": s_year, "month": s_month, "day": s_day}, "endDate": {"year": e_year, "month": e_month, "day": e_day}}]}}
-            except Exception:
-                pass
-        
-        async with httpx.AsyncClient(timeout=30) as client:
-            while True:
-                if page_token: req_body["pageToken"] = page_token
-                resp = await client.post(f"{GOOGLE_LIBRARY_API}/mediaItems:search", headers={"Authorization": f"Bearer {google_token}"}, json=req_body)
-                resp.raise_for_status()
-                data = resp.json()
-                fetched_items = data.get("mediaItems", [])
-                if fetched_items: media_items.extend(fetched_items)
-                GOOGLE_IMPORT_STATUS[sid] = {"status": "importing", "count": 0, "total": len(media_items)}
-                page_token = data.get("nextPageToken")
-                if not page_token: break
-
-        if not media_items:
-            GOOGLE_IMPORT_STATUS[sid] = {"status": "done", "count": 0, "total": 0}
-            return
-
-        count = 0
-        async with httpx.AsyncClient(timeout=60) as client:
-            for media_item in media_items:
-                try: await import_one_google_item(client, sid, google_token, onedrive_token, media_item)
-                except Exception: pass
-                count += 1
-                GOOGLE_IMPORT_STATUS[sid] = {"status": "importing", "count": count, "total": len(media_items)}
-
-        GOOGLE_IMPORT_STATUS[sid] = {"status": "done", "count": count, "total": len(media_items)}
-        await backup_db_to_onedrive(sid, onedrive_token)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        GOOGLE_IMPORT_STATUS[sid] = {"status": "error", "error": str(e)}
 
 # ---------------------------------------------------------------------------
 # OneDrive 掃描
@@ -1262,12 +981,6 @@ async def download_full_image(client: httpx.AsyncClient, token: str, item_id: st
     except Exception: return None
 
 async def get_full_image_bytes(client: httpx.AsyncClient, item: dict, token: str | None) -> bytes | None:
-    if item.get("source") == "google":
-        url_path = item.get("thumbnail_large_url") or item.get("thumbnail_url")
-        if not url_path: return None
-        fs_path = google_media_fs_path(url_path)
-        if not os.path.isfile(fs_path): return None
-        return await asyncio.to_thread(lambda: open(fs_path, "rb").read())
     if not token: return None
     return await download_full_image(client, token, item["id"])
 
@@ -1415,53 +1128,83 @@ async def memories_video(job_id: str):
     return FileResponse(job["video_path"], media_type="video/mp4")
 
 # ---------------------------------------------------------------------------
-# 圖庫清單
+# 圖庫清單(依月份分組 + 分頁載入,大量照片也不會一次塞爆整頁)
 # ---------------------------------------------------------------------------
-def render_gallery_html(items: list[dict], status: dict, google_status: dict) -> str:
-    cards = "".join(lb_img_tag(item) for item in items if item.get("thumbnail_url"))
-    scan_state = status.get("status", "idle"); scanned_count = status.get("count", 0); google_state = google_status.get("status", "idle")
+def group_photos_by_month(items: list[dict]) -> list[tuple[str, list[dict]]]:
+    """items 已經是 taken_date_time DESC 排序(見 db_get_photos),所以只要依序分組,
+    月份的先後順序就會自動維持正確,沒有拍攝時間的照片會落在最後一組。"""
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    order: list[str] = []
+    for it in items:
+        dt = parse_taken(it)
+        month_key = dt.strftime("%Y-%m") if dt else "未知拍攝時間"
+        if month_key not in grouped:
+            order.append(month_key)
+        grouped[month_key].append(it)
+    return [(mk, grouped[mk]) for mk in order]
+
+def month_label(month_key: str) -> str:
+    if month_key == "未知拍攝時間": return month_key
+    try:
+        y, m = month_key.split("-")
+        return f"{y} 年 {int(m)} 月"
+    except Exception:
+        return month_key
+
+def render_gallery_html(items: list[dict], status: dict, visible_months: int) -> str:
+    scan_state = status.get("status", "idle"); scanned_count = status.get("count", 0)
     banners = ""
-    
-    if scan_state == "scanning": 
+
+    if scan_state == "scanning":
         banners += f"""<div class="card banner-warning">正在背景整理你的 OneDrive,目前已掃到 {scanned_count} 張……</div>"""
-    elif scan_state == "error": 
+    elif scan_state == "error":
         banners += f"""<div class="card banner-error">OneDrive 掃描時發生錯誤:{status.get("error")}</div>"""
-    elif scan_state == "idle": 
+    elif scan_state == "idle" and not items:
         banners += """<div class="card banner-info">尚未開始整理 OneDrive。<a class="pill-link" href="/scan/start">開始掃描</a></div>"""
 
-    if google_state == "importing": 
-        google_count = google_status.get("count",0)
-        google_total = google_status.get("total",0)
-        banners += f"""<div class="card banner-warning">正在自動匯入 Google 相簿({google_count}/{google_total})……</div>"""
-
-    refresh = 3 if scan_state == "scanning" or google_state in ("importing", ) else None
-    google_href = "/google/sync/options" if GOOGLE_ENABLED else "/more"
+    refresh = 3 if scan_state == "scanning" else None
     empty_state = "" if items else """
     <div class="card">
-        <p class="secondary">目前圖庫是空的,掃描 OneDrive 或連結 Google 相簿後照片就會出現在這裡。</p>
+        <p class="secondary">目前圖庫是空的,掃描 OneDrive 後照片就會出現在這裡。</p>
     </div>
     """
-    
+
+    month_groups = group_photos_by_month(items)
+    shown_groups = month_groups[:visible_months]
+    remaining_months = len(month_groups) - len(shown_groups)
+
+    jump_links = "".join(
+        f'<a class="pill-link" href="#m-{mk}">{month_label(mk)}</a>'
+        for mk, _ in shown_groups
+    )
+    jump_nav = f'<div style="margin-bottom:14px; overflow-x:auto; white-space:nowrap;">{jump_links}</div>' if len(shown_groups) > 1 else ""
+
+    sections = "".join(f"""
+    <div id="m-{mk}" class="section-title">{month_label(mk)}({len(group_items)} 張)</div>
+    <div class="photo-grid">{"".join(lb_img_tag(it) for it in group_items if it.get("thumbnail_url"))}</div>
+    """ for mk, group_items in shown_groups)
+
+    load_more = f"""
+    <a class="btn-secondary" href="/gallery?months={visible_months + GALLERY_MONTHS_PER_PAGE}">顯示更早的照片(還有 {remaining_months} 個月份未顯示)</a>
+    """ if remaining_months > 0 else ""
+
     body = f"""
     {banners}
-    <div class="btn-row" style="margin-bottom:14px;">
-        <a class="btn-secondary" href="/scan/start">重新掃描 OneDrive</a>
-        <a class="btn-secondary" href="{google_href}">同步 Google 相簿</a>
-    </div>
-    <div class="photo-grid">
-        {cards}
-    </div>
+    <a class="btn-secondary" href="/scan/start" style="margin-bottom:14px;">重新掃描 OneDrive</a>
+    {jump_nav}
+    {sections}
     {empty_state}
+    {load_more}
     """
     return page_shell(f"我的圖庫({len(items)})", body, active_tab="gallery", meta_refresh=refresh)
 
 @app.get("/gallery", response_class=HTMLResponse)
-async def gallery(request: Request):
+async def gallery(request: Request, months: int = GALLERY_MONTHS_PER_PAGE):
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
     if not sid or not token: return RedirectResponse("/login", status_code=303)
     status = SCAN_STATUS.get(sid, {"status": "idle", "count": 0})
-    return HTMLResponse(render_gallery_html(db_get_photos(sid), status, GOOGLE_IMPORT_STATUS.get(sid, {"status": "idle"})))
+    return HTMLResponse(render_gallery_html(db_get_photos(sid), status, max(1, months)))
 
 @app.get("/photos")
 async def photos(request: Request, max_depth: int = 6):
