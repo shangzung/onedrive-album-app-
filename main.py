@@ -15,6 +15,7 @@ import subprocess
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 import httpx
 import imagehash
@@ -122,6 +123,11 @@ select.apple-select, input.apple-input { width: 100%; padding: 10px 12px; border
 .photo-tile { position: relative; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 3px; background: var(--border); }
 .photo-tile img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
 .photo-badge { position: absolute; left: 4px; bottom: 4px; font-size: 12px; background: rgba(0,0,0,0.55); color: #fff; border-radius: 6px; padding: 1px 5px; line-height: 1.4; }
+.tile-actions { position: absolute; top: 4px; left: 4px; right: 4px; display: flex; justify-content: space-between; pointer-events: none; }
+.tile-btn { pointer-events: auto; width: 24px; height: 24px; border-radius: 50%; border: none; background: rgba(0,0,0,0.5); color: #fff; font-size: 13px; line-height: 24px; text-align: center; padding: 0; cursor: pointer; }
+.tile-btn.fav-btn.active { background: var(--warning); color: #000; }
+.tile-btn.del-btn:active { background: var(--danger); }
+.tile-btn:disabled { opacity: 0.5; }
 .group-card { margin-bottom: 14px; }
 .group-title { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
 .group-sub { color: var(--secondary); font-size: 12px; margin-bottom: 8px; }
@@ -143,9 +149,15 @@ LIGHTBOX_ASSETS = """
 .lb-nav { position: fixed; top: 50%; transform: translateY(-50%); background: rgba(120,120,128,0.32); color: #fff; border: none; font-size: 22px; width: 42px; height: 42px; border-radius: 50%; cursor: pointer; }
 #lb-prev { left: 12px; } #lb-next { right: 12px; }
 #lb-close { position: fixed; top: calc(16px + env(safe-area-inset-top,0px)); right: 16px; color: #fff; font-size: 20px; background: rgba(120,120,128,0.32); border: none; width: 32px; height: 32px; border-radius: 50%; cursor: pointer; }
+.lb-top-btn { position: fixed; top: calc(16px + env(safe-area-inset-top,0px)); color: #fff; font-size: 16px; background: rgba(120,120,128,0.32); border: none; width: 32px; height: 32px; border-radius: 50%; cursor: pointer; }
+.lb-top-btn.active { background: var(--warning); color: #000; }
+#lb-fav-btn { right: 60px; }
+#lb-del-btn { right: 104px; background: rgba(255,59,48,0.5); }
 </style>
 <div id="lightbox-overlay">
     <button id="lb-close" onclick="closeLightbox()">&times;</button>
+    <button id="lb-fav-btn" class="lb-top-btn" onclick="toggleFavoritePhoto(this)">&#9734;</button>
+    <button id="lb-del-btn" class="lb-top-btn" onclick="quickDeletePhoto(this)">&#128465;</button>
     <button id="lb-prev" class="lb-nav" onclick="navLightbox(-1)">&#8249;</button>
     <img id="lightbox-img" src="" />
     <div id="lightbox-caption"></div>
@@ -155,11 +167,59 @@ LIGHTBOX_ASSETS = """
 let lbThumbs = []; let lbIndex = 0;
 function initLightbox() { lbThumbs = Array.from(document.querySelectorAll('.lb-thumb')); lbThumbs.forEach((img, i) => { img.addEventListener('click', () => openLightbox(i)); }); }
 function openLightbox(i) { lbIndex = i; showLightbox(); document.getElementById('lightbox-overlay').classList.add('active'); }
-function showLightbox() { const t = lbThumbs[lbIndex]; document.getElementById('lightbox-img').src = t.dataset.full || t.src; document.getElementById('lightbox-caption').textContent = (t.dataset.name || '') + (t.dataset.taken ? '  ・  ' + t.dataset.taken : ''); }
+function showLightbox() {
+    const t = lbThumbs[lbIndex];
+    document.getElementById('lightbox-img').src = t.dataset.full || t.src;
+    document.getElementById('lightbox-caption').textContent = (t.dataset.name || '') + (t.dataset.taken ? '  ・  ' + t.dataset.taken : '');
+    const favBtn = document.getElementById('lb-fav-btn');
+    favBtn.dataset.id = t.dataset.id || '';
+    const isFav = t.dataset.fav === '1';
+    favBtn.innerHTML = isFav ? '&#9733;' : '&#9734;';
+    favBtn.classList.toggle('active', isFav);
+    document.getElementById('lb-del-btn').dataset.id = t.dataset.id || '';
+}
 function navLightbox(delta) { if (lbThumbs.length === 0) return; lbIndex = (lbIndex + delta + lbThumbs.length) % lbThumbs.length; showLightbox(); }
 function closeLightbox() { document.getElementById('lightbox-overlay').classList.remove('active'); }
 document.addEventListener('keydown', (e) => { if (!document.getElementById('lightbox-overlay').classList.contains('active')) return; if (e.key === 'Escape') closeLightbox(); if (e.key === 'ArrowLeft') navLightbox(-1); if (e.key === 'ArrowRight') navLightbox(1); });
 document.addEventListener('DOMContentLoaded', initLightbox);
+
+async function toggleFavoritePhoto(btn) {
+    const id = btn.dataset.id; if (!id) return;
+    btn.disabled = true;
+    try {
+        const resp = await fetch('/api/photo/favorite', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + encodeURIComponent(id) });
+        const data = await resp.json();
+        if (data.success) {
+            document.querySelectorAll('.fav-btn[data-id="' + id + '"]').forEach(el => { el.classList.toggle('active', data.favorite); el.innerHTML = data.favorite ? '&#9733;' : '&#9734;'; });
+            const t = lbThumbs.find(x => x.dataset.id === id); if (t) t.dataset.fav = data.favorite ? '1' : '0';
+            const lbBtn = document.getElementById('lb-fav-btn');
+            if (lbBtn && lbBtn.dataset.id === id) { lbBtn.innerHTML = data.favorite ? '&#9733;' : '&#9734;'; lbBtn.classList.toggle('active', data.favorite); }
+        }
+    } catch (e) { /* 網路錯誤時安靜失敗,不打斷瀏覽 */ }
+    btn.disabled = false;
+}
+
+async function quickDeletePhoto(btn) {
+    const id = btn.dataset.id; if (!id) return;
+    if (!confirm('確定要刪除這張照片嗎?(會移到 OneDrive 回收桶,需要的話可以在 OneDrive 還原)')) return;
+    btn.disabled = true;
+    try {
+        const resp = await fetch('/api/photo/delete', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + encodeURIComponent(id) });
+        const data = await resp.json();
+        if (data.success) { removePhotoEverywhere(id); }
+        else { alert('刪除失敗:' + (data.error || '未知錯誤')); btn.disabled = false; }
+    } catch (e) { alert('刪除失敗,請檢查網路連線。'); btn.disabled = false; }
+}
+function removePhotoEverywhere(id) {
+    document.querySelectorAll('.photo-tile[data-id="' + id + '"]').forEach(el => el.remove());
+    const wasInLightbox = document.getElementById('lightbox-overlay').classList.contains('active');
+    const idx = lbThumbs.findIndex(t => t.dataset.id === id);
+    if (idx !== -1) {
+        lbThumbs.splice(idx, 1);
+        if (lbThumbs.length === 0) { closeLightbox(); }
+        else if (wasInLightbox) { lbIndex = Math.min(lbIndex, lbThumbs.length - 1); showLightbox(); }
+    }
+}
 </script>
 """
 
@@ -223,11 +283,17 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
     full = item.get("thumbnail_large_url") or item.get("thumbnailLargeUrl") or item.get("web_url") or item.get("webUrl") or thumb
     name = (item.get("name") or "").replace('"', "&quot;")
     taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
+    item_id = (item.get("id") or "").replace('"', "&quot;")
+    is_fav = bool(item.get("favorite"))
     badge_html = f'<div class="photo-badge">{badge}</div>' if badge else ""
     return f"""
-    <div class="photo-tile">
-        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" loading="lazy" />
+    <div class="photo-tile" data-id="{item_id}">
+        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" data-id="{item_id}" data-fav="{"1" if is_fav else "0"}" loading="lazy" />
         {badge_html}
+        <div class="tile-actions">
+            <button type="button" class="tile-btn fav-btn{" active" if is_fav else ""}" data-id="{item_id}" onclick="event.stopPropagation(); toggleFavoritePhoto(this);" title="加入最愛">{"&#9733;" if is_fav else "&#9734;"}</button>
+            <button type="button" class="tile-btn del-btn" data-id="{item_id}" onclick="event.stopPropagation(); quickDeletePhoto(this);" title="刪除">&#128465;</button>
+        </div>
     </div>
     """
 
@@ -247,13 +313,36 @@ def init_db():
             PRIMARY KEY (sid, id)
         )
     """)
-    for column, col_type in [("phash", "TEXT"), ("width", "INTEGER"), ("height", "INTEGER"), ("thumbnail_large_url", "TEXT"), ("source", "TEXT DEFAULT 'onedrive'"), ("cleanup_skip", "INTEGER DEFAULT 0")]:
+    for column, col_type in [("phash", "TEXT"), ("width", "INTEGER"), ("height", "INTEGER"), ("thumbnail_large_url", "TEXT"), ("source", "TEXT DEFAULT 'onedrive'"), ("cleanup_skip", "INTEGER DEFAULT 0"), ("favorite", "INTEGER DEFAULT 0"), ("camera_make", "TEXT"), ("camera_model", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {col_type}")
         except sqlite3.OperationalError:
             pass
     # 不再支援 Google 相簿,清掉舊的 Google 來源紀錄(縮圖快取在本機硬碟,早已不可靠)。
     conn.execute("DELETE FROM photos WHERE source = 'google'")
+    # 地點名稱快取(反向地理編碼結果),避免每次都重打 Nominatim,也讓重啟後不用重查。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS location_cache (
+            lat_r REAL NOT NULL, lng_r REAL NOT NULL, name TEXT,
+            PRIMARY KEY (lat_r, lng_r)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def load_location_cache() -> dict[tuple, str]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT lat_r, lng_r, name FROM location_cache").fetchall()
+    conn.close()
+    return {(r[0], r[1]): r[2] for r in rows}
+
+def save_location_cache_entry(lat_r: float, lng_r: float, name: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO location_cache (lat_r, lng_r, name) VALUES (?, ?, ?) "
+        "ON CONFLICT(lat_r, lng_r) DO UPDATE SET name=excluded.name",
+        (lat_r, lng_r, name),
+    )
     conn.commit()
     conn.close()
 
@@ -349,6 +438,14 @@ async def more_page(request: Request):
     if not sid: return RedirectResponse("/login", status_code=303)
 
     body = """
+    <div class="list-group">
+        <a class="list-row tappable" href="/years"><span class="row-icon">🗓️</span><span class="row-label">年份總覽</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/locations"><span class="row-icon">📍</span><span class="row-label">拍攝地點(含地圖)</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/search"><span class="row-icon">🔍</span><span class="row-label">圖庫搜尋</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/favorites"><span class="row-icon">⭐</span><span class="row-label">我的最愛</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/cameras"><span class="row-icon">📷</span><span class="row-label">依相機/裝置分類</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/storage"><span class="row-icon">📊</span><span class="row-label">儲存空間統計</span><span class="chevron">›</span></a>
+    </div>
     <div class="list-group">
         <a class="list-row tappable" href="/duplicates/view"><span class="row-icon">🧬</span><span class="row-label">疑似重複照片</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/cleanup"><span class="row-icon">🧹</span><span class="row-label">快速清理(安全緩衝模式)</span><span class="chevron">›</span></a>
@@ -457,6 +554,7 @@ async def fetch_media_iter(token: str, folder_path: str = "root", depth: int = 0
                     "thumbnailLargeUrl": thumbs.get("large", {}).get("url"), "takenDateTime": photo_meta.get("takenDateTime"),
                     "latitude": location.get("latitude"), "longitude": location.get("longitude"),
                     "width": image_meta.get("width"), "height": image_meta.get("height"), "source": "onedrive",
+                    "cameraMake": photo_meta.get("cameraMake"), "cameraModel": photo_meta.get("cameraModel"),
                 }
             url = data.get("@odata.nextLink")
 
@@ -469,13 +567,14 @@ def db_upsert_photo(sid: str, item: dict):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
-        INSERT INTO photos (sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url, taken_date_time, latitude, longitude, phash, width, height, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO photos (sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url, taken_date_time, latitude, longitude, phash, width, height, source, camera_make, camera_model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sid, id) DO UPDATE SET
             name=excluded.name, mime_type=excluded.mime_type, size=excluded.size, web_url=excluded.web_url, thumbnail_url=excluded.thumbnail_url, thumbnail_large_url=excluded.thumbnail_large_url,
-            taken_date_time=excluded.taken_date_time, latitude=excluded.latitude, longitude=excluded.longitude, phash=excluded.phash, width=excluded.width, height=excluded.height, source=excluded.source
+            taken_date_time=excluded.taken_date_time, latitude=excluded.latitude, longitude=excluded.longitude, phash=excluded.phash, width=excluded.width, height=excluded.height, source=excluded.source,
+            camera_make=excluded.camera_make, camera_model=excluded.camera_model
         """,
-        (sid, item["id"], item.get("name"), item.get("mimeType"), item.get("size"), item.get("webUrl"), item.get("thumbnailUrl"), item.get("thumbnailLargeUrl"), item.get("takenDateTime"), item.get("latitude"), item.get("longitude"), item.get("phash"), item.get("width"), item.get("height"), item.get("source", "onedrive")),
+        (sid, item["id"], item.get("name"), item.get("mimeType"), item.get("size"), item.get("webUrl"), item.get("thumbnailUrl"), item.get("thumbnailLargeUrl"), item.get("takenDateTime"), item.get("latitude"), item.get("longitude"), item.get("phash"), item.get("width"), item.get("height"), item.get("source", "onedrive"), item.get("cameraMake"), item.get("cameraModel")),
     )
     conn.commit()
     conn.close()
@@ -492,13 +591,14 @@ def db_restore_sid_rows(sid: str, rows: list[dict]):
     for r in rows:
         conn.execute(
             """
-            INSERT INTO photos (sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url, taken_date_time, latitude, longitude, phash, width, height, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO photos (sid, id, name, mime_type, size, web_url, thumbnail_url, thumbnail_large_url, taken_date_time, latitude, longitude, phash, width, height, source, favorite, camera_make, camera_model)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(sid, id) DO UPDATE SET
                 name=excluded.name, mime_type=excluded.mime_type, size=excluded.size, web_url=excluded.web_url, thumbnail_url=excluded.thumbnail_url, thumbnail_large_url=excluded.thumbnail_large_url,
-                taken_date_time=excluded.taken_date_time, latitude=excluded.latitude, longitude=excluded.longitude, phash=excluded.phash, width=excluded.width, height=excluded.height, source=excluded.source
+                taken_date_time=excluded.taken_date_time, latitude=excluded.latitude, longitude=excluded.longitude, phash=excluded.phash, width=excluded.width, height=excluded.height, source=excluded.source,
+                favorite=excluded.favorite, camera_make=excluded.camera_make, camera_model=excluded.camera_model
             """,
-            (sid, r.get("id"), r.get("name"), r.get("mime_type"), r.get("size"), r.get("web_url"), r.get("thumbnail_url"), r.get("thumbnail_large_url"), r.get("taken_date_time"), r.get("latitude"), r.get("longitude"), r.get("phash"), r.get("width"), r.get("height"), r.get("source", "onedrive")),
+            (sid, r.get("id"), r.get("name"), r.get("mime_type"), r.get("size"), r.get("web_url"), r.get("thumbnail_url"), r.get("thumbnail_large_url"), r.get("taken_date_time"), r.get("latitude"), r.get("longitude"), r.get("phash"), r.get("width"), r.get("height"), r.get("source", "onedrive"), r.get("favorite", 0), r.get("camera_make"), r.get("camera_model")),
         )
     conn.commit()
     conn.close()
@@ -854,6 +954,136 @@ async def cleanup_skip(request: Request, ids: str = Form(...)):
     return RedirectResponse("/cleanup", status_code=303)
 
 # ---------------------------------------------------------------------------
+# 單張照片快速操作:馬上刪除(送到 OneDrive 回收桶,可還原) + 我的最愛
+# ---------------------------------------------------------------------------
+@app.post("/api/photo/delete")
+async def api_delete_photo(request: Request, id: str = Form(...)):
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token: return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT source FROM photos WHERE sid = ? AND id = ?", (sid, id)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"success": False, "error": "not_found"}, status_code=404)
+
+    if row["source"] == "onedrive":
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                for attempt in range(5):
+                    resp = await client.delete(f"{GRAPH_BASE}/me/drive/items/{id}", headers=headers)
+                    if resp.status_code == 429:
+                        await asyncio.sleep(int(resp.headers.get("Retry-After", 3)))
+                        continue
+                    if resp.status_code not in (204, 404):
+                        resp.raise_for_status()
+                    break
+        except Exception as e:
+            conn.close()
+            return JSONResponse({"success": False, "error": str(e)}, status_code=502)
+
+    conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, id))
+    conn.commit()
+    conn.close()
+    asyncio.create_task(backup_db_to_onedrive(sid, token))
+    return JSONResponse({"success": True})
+
+@app.post("/api/photo/favorite")
+async def api_toggle_favorite(request: Request, id: str = Form(...)):
+    sid = request.session.get("sid")
+    if not sid: return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT favorite FROM photos WHERE sid = ? AND id = ?", (sid, id)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"success": False, "error": "not_found"}, status_code=404)
+
+    new_val = 0 if row["favorite"] else 1
+    conn.execute("UPDATE photos SET favorite = ? WHERE sid = ? AND id = ?", (new_val, sid, id))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"success": True, "favorite": bool(new_val)})
+
+@app.get("/favorites", response_class=HTMLResponse)
+async def favorites_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    items = [it for it in db_get_photos(sid) if it.get("favorite")]
+
+    if not items:
+        body = """<div class="card"><p class="secondary">目前還沒有加入最愛的照片。瀏覽照片時點縮圖左上角的 ☆,或在放大檢視時點右上角的星星,就能收藏。</p></div>"""
+    else:
+        body = f"""
+        <p class="secondary" style="margin:0 6px 14px;">共 {len(items)} 張最愛照片。</p>
+        <div class="photo-grid">{"".join(lb_img_tag(it) for it in items if it.get("thumbnail_url"))}</div>
+        """
+    return HTMLResponse(page_shell("我的最愛", body, active_tab="more", back_href="/more"))
+
+# ---------------------------------------------------------------------------
+# 儲存空間統計
+# ---------------------------------------------------------------------------
+def format_bytes(n: int | None) -> str:
+    if not n: return "0 B"
+    size = float(n)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+@app.get("/storage", response_class=HTMLResponse)
+async def storage_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+
+    if not items:
+        body = """<div class="card"><p class="secondary">圖庫還是空的,掃描 OneDrive 後這裡就會出現空間統計。</p></div>"""
+        return HTMLResponse(page_shell("儲存空間統計", body, active_tab="more", back_href="/more"))
+
+    total_size = sum(it.get("size") or 0 for it in items)
+    screenshots = [it for it in items if is_screenshot(it)]
+    videos = [it for it in items if (it.get("mime_type") or "").startswith("video/")]
+    screenshot_ids = {it["id"] for it in screenshots}; video_ids = {it["id"] for it in videos}
+    photos_only_count = len(items) - len(screenshots) - len(videos)
+    screenshot_size = sum(it.get("size") or 0 for it in screenshots)
+    video_size = sum(it.get("size") or 0 for it in videos)
+    photo_size = total_size - screenshot_size - video_size
+
+    by_year: dict[str, int] = defaultdict(int)
+    for it in items:
+        dt = parse_taken(it)
+        by_year[str(dt.year) if dt else "未知年份"] += (it.get("size") or 0)
+
+    largest = sorted(items, key=lambda it: it.get("size") or 0, reverse=True)[:12]
+
+    year_rows = "".join(f"""
+    <div class="list-row"><span class="row-icon">🗓️</span><span class="row-label">{y}</span><span class="row-value">{format_bytes(sz)}</span></div>
+    """ for y, sz in sorted(by_year.items(), key=lambda kv: -kv[1]))
+
+    body = f"""
+    <div class="card" style="text-align:center;">
+        <div class="stat-num">{format_bytes(total_size)}</div>
+        <div class="secondary">共 {len(items)} 個檔案</div>
+    </div>
+    <div class="list-group">
+        <div class="list-row"><span class="row-icon">🖼</span><span class="row-label">一般照片</span><span class="row-value">{photos_only_count} 張・{format_bytes(photo_size)}</span></div>
+        <div class="list-row"><span class="row-icon">📱</span><span class="row-label">螢幕截圖</span><span class="row-value">{len(screenshots)} 張・{format_bytes(screenshot_size)}</span></div>
+        <div class="list-row"><span class="row-icon">🎬</span><span class="row-label">影片</span><span class="row-value">{len(videos)} 支・{format_bytes(video_size)}</span></div>
+    </div>
+    <div class="section-title">依年份佔用空間</div>
+    <div class="list-group">{year_rows or '<div class="list-row"><span class="secondary">尚無資料</span></div>'}</div>
+    <div class="section-title">最大的檔案(前 12 個,適合檢查要不要刪)</div>
+    <div class="photo-grid">{"".join(lb_img_tag(it, badge=format_bytes(it.get("size") or 0)) for it in largest if it.get("thumbnail_url"))}</div>
+    """
+    return HTMLResponse(page_shell("儲存空間統計", body, active_tab="more", back_href="/more"))
+
+# ---------------------------------------------------------------------------
 # 自動分類
 # ---------------------------------------------------------------------------
 def parse_taken(item: dict) -> datetime | None:
@@ -880,7 +1110,58 @@ def cluster_by_location(items: list[dict], precision: int = LOCATION_PRECISION) 
         if lat is not None and lng is not None: buckets.setdefault((round(lat, precision), round(lng, precision)), []).append(it)
     return buckets
 
-def render_albums_html(items: list[dict]) -> str:
+# ---------------------------------------------------------------------------
+# 拍攝地點命名(免費反向地理編碼,使用 OpenStreetMap Nominatim,不需要金鑰、不用付費)
+# 依 Nominatim 使用政策:每秒最多 1 次請求,並且需要帶 User-Agent。
+# ---------------------------------------------------------------------------
+LOCATION_NAME_CACHE: dict[tuple, str] = load_location_cache()
+_geocode_lock = asyncio.Lock()
+
+async def reverse_geocode(lat: float, lng: float, precision: int = LOCATION_PRECISION) -> str:
+    key = (round(lat, precision), round(lng, precision))
+    if key in LOCATION_NAME_CACHE:
+        return LOCATION_NAME_CACHE[key]
+    async with _geocode_lock:
+        if key in LOCATION_NAME_CACHE:
+            return LOCATION_NAME_CACHE[key]
+        name = f"{key[0]:.2f}, {key[1]:.2f}"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://nominatim.openstreetmap.org/reverse",
+                    params={"lat": lat, "lon": lng, "format": "jsonv2", "accept-language": "zh-TW", "zoom": 14},
+                    headers={"User-Agent": "MyAlbumApp/1.0 (personal photo album, non-commercial)"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                addr = data.get("address", {})
+                name = (
+                    addr.get("suburb") or addr.get("neighbourhood") or addr.get("town")
+                    or addr.get("city_district") or addr.get("city") or addr.get("county")
+                    or (data.get("display_name", "").split(",")[0] if data.get("display_name") else None)
+                    or name
+                )
+            await asyncio.sleep(1.0)  # 遵守 Nominatim 每秒最多 1 次請求的限制
+        except Exception:
+            pass
+        LOCATION_NAME_CACHE[key] = name
+        save_location_cache_entry(key[0], key[1], name)
+        return name
+
+async def annotate_location_names(buckets: list[tuple[tuple, list[dict]]], max_lookup: int = 25) -> list[tuple[tuple, list[dict], str]]:
+    """幫地點分組加上人類看得懂的地名。為了避免一次觸發太多次 Nominatim 查詢(每秒限 1 次),
+    只主動查詢照片數最多的前 max_lookup 組,其餘先用座標當名稱顯示,之後點進去也能觸發查詢。"""
+    result = []
+    for idx, (coords, group) in enumerate(buckets):
+        if idx < max_lookup:
+            name = await reverse_geocode(coords[0], coords[1])
+        else:
+            key = (round(coords[0], LOCATION_PRECISION), round(coords[1], LOCATION_PRECISION))
+            name = LOCATION_NAME_CACHE.get(key, f"{coords[0]:.2f}, {coords[1]:.2f}")
+        result.append((coords, group, name))
+    return result
+
+async def render_albums_html(items: list[dict]) -> str:
     screenshots = [it for it in items if is_screenshot(it)]
     videos = [it for it in items if (it.get("mime_type") or "").startswith("video/")]
     exclude_ids = {it["id"] for it in screenshots} | {it["id"] for it in videos}
@@ -896,20 +1177,34 @@ def render_albums_html(items: list[dict]) -> str:
         <div class="photo-grid">{thumb_row(ev["items"])}</div>
     </div>
     """ for ev in events) or """<div class="card"><p class="secondary">還沒有足夠的拍攝時間資料可以分組。</p></div>"""
-    
+
+    sorted_locations = sorted(location_buckets.items(), key=lambda kv: -len(kv[1]))[:12]
+    named_locations = await annotate_location_names(sorted_locations)
     location_html = "".join(f"""
     <div class="card group-card">
-        <div class="group-title">地點 #{idx}</div>
-        <div class="group-sub">共 {len(group)} 張・<a class="pill-link" href="https://www.google.com/maps?q={coords[0]},{coords[1]}" target="_blank">在地圖上看</a></div>
+        <div class="group-title">📍 {name}</div>
+        <div class="group-sub">共 {len(group)} 張・<a class="pill-link" href="/locations/view?lat={coords[0]}&lng={coords[1]}">看這個地點的照片</a>・<a class="pill-link" href="https://www.google.com/maps?q={coords[0]},{coords[1]}" target="_blank">在地圖上看</a></div>
         <div class="photo-grid">{thumb_row(group)}</div>
     </div>
-    """ for idx, (coords, group) in enumerate(sorted(location_buckets.items(), key=lambda kv: -len(kv[1])), start=1)) or """<div class="card"><p class="secondary">目前沒有帶 GPS 座標的照片。</p></div>"""
+    """ for coords, group, name in named_locations) or """<div class="card"><p class="secondary">目前沒有帶 GPS 座標的照片。</p></div>"""
+    more_locations = f"""<a class="btn-secondary" href="/locations">看全部 {len(location_buckets)} 個拍攝地點(含地圖總覽)</a>""" if location_buckets else ""
+
+    camera_buckets = cluster_by_camera(photos_only)
+    sorted_cameras = sorted(camera_buckets.items(), key=lambda kv: -len(kv[1]))[:6]
+    camera_html = "".join(f"""
+    <div class="card group-card">
+        <div class="group-title">📷 {label}</div>
+        <div class="group-sub">共 {len(group)} 張・<a class="pill-link" href="/cameras/view?model={quote(label)}">看這台裝置拍的照片</a></div>
+        <div class="photo-grid">{thumb_row(group)}</div>
+    </div>
+    """ for label, group in sorted_cameras) or """<div class="card"><p class="secondary">目前沒有相機/裝置資訊(部分照片本身可能沒有內嵌這項資料,或還沒重新掃描)。</p></div>"""
+    more_cameras = f"""<a class="btn-secondary" href="/cameras">看全部 {len(camera_buckets)} 種相機/裝置</a>""" if len(camera_buckets) > 6 else ""
 
     screenshot_empty = "" if screenshots else """<p class="secondary">目前沒有偵測到螢幕截圖。</p>"""
     video_empty = "" if videos else """<p class="secondary">目前沒有影片。</p>"""
 
     body = f"""
-    <p class="secondary" style="margin:0 6px 14px;">全部用現有的拍攝時間 / GPS / 檔名資料分類,沒有呼叫任何外部 AI 服務。</p>
+    <p class="secondary" style="margin:0 6px 14px;">全部用現有的拍攝時間 / GPS / 檔名 / 裝置資料分類,地點名稱來自免費的 OpenStreetMap,沒有呼叫任何付費 AI 服務。</p>
     <div class="section-title">螢幕截圖({len(screenshots)} 張)</div>
     <div class="card">
         <div class="photo-grid">{thumb_row(screenshots, limit=24) or ""}</div>
@@ -922,8 +1217,12 @@ def render_albums_html(items: list[dict]) -> str:
     </div>
     <div class="section-title">依日期分的事件相簿({len(events)} 組)</div>
     {events_html}
-    <div class="section-title">依地點分的相簿({len(location_buckets)} 組)</div>
+    <div class="section-title">依地點分的相簿(前 {len(named_locations)} / {len(location_buckets)} 組)</div>
     {location_html}
+    {more_locations}
+    <div class="section-title">依相機/裝置分的相簿(前 {len(sorted_cameras)} / {len(camera_buckets)} 種)</div>
+    {camera_html}
+    {more_cameras}
     """
     return page_shell("自動分類", body, active_tab="albums")
 
@@ -931,7 +1230,202 @@ def render_albums_html(items: list[dict]) -> str:
 async def albums(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(render_albums_html(db_get_photos(sid)))
+    return HTMLResponse(await render_albums_html(db_get_photos(sid)))
+
+# ---------------------------------------------------------------------------
+# 依相機/裝置分類
+# ---------------------------------------------------------------------------
+def cluster_by_camera(items: list[dict]) -> dict[str, list[dict]]:
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for it in items:
+        model = (it.get("camera_model") or "").strip()
+        make = (it.get("camera_make") or "").strip()
+        label = model or make or "未知裝置"
+        buckets[label].append(it)
+    return buckets
+
+@app.get("/cameras", response_class=HTMLResponse)
+async def cameras_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+    screenshot_ids = {it["id"] for it in items if is_screenshot(it)}
+    photos_only = [it for it in items if it["id"] not in screenshot_ids]
+    buckets = cluster_by_camera(photos_only)
+    sorted_buckets = sorted(buckets.items(), key=lambda kv: -len(kv[1]))
+
+    if not sorted_buckets:
+        body = """<div class="card"><p class="secondary">目前沒有相機/裝置資訊,重新掃描 OneDrive 後才會出現(部分照片本身可能沒有內嵌這項資料)。</p></div>"""
+    else:
+        rows = "".join(f"""
+        <a class="list-row tappable" href="/cameras/view?model={quote(label)}">
+            <span class="row-icon">📷</span>
+            <span class="row-label">{label}</span>
+            <span class="row-value">{len(group)} 張</span>
+            <span class="chevron">›</span>
+        </a>
+        """ for label, group in sorted_buckets)
+        body = f"""
+        <p class="secondary" style="margin:0 6px 14px;">依照片內嵌的拍攝裝置資訊分組(來自 OneDrive 照片 metadata)。</p>
+        <div class="list-group">{rows}</div>
+        """
+    return HTMLResponse(page_shell("依相機/裝置分類", body, active_tab="albums", back_href="/albums"))
+
+@app.get("/cameras/view", response_class=HTMLResponse)
+async def camera_view(request: Request, model: str):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+    matched = [it for it in items if ((it.get("camera_model") or "").strip() or (it.get("camera_make") or "").strip() or "未知裝置") == model]
+
+    if not matched:
+        body = """<div class="card"><p class="secondary">找不到這個裝置拍的照片。</p></div>"""
+    else:
+        thumbs = "".join(lb_img_tag(it) for it in matched if it.get("thumbnail_url"))
+        body = f"""
+        <div class="card" style="text-align:center;">
+            <div class="stat-num">{len(matched)}</div>
+            <div class="secondary">張照片由這台裝置拍攝</div>
+        </div>
+        <div class="photo-grid">{thumbs}</div>
+        """
+    return HTMLResponse(page_shell(f"📷 {model}", body, active_tab="albums", back_href="/cameras"))
+
+# ---------------------------------------------------------------------------
+# 拍攝地點:地圖總覽 + 依地點篩選照片
+# ---------------------------------------------------------------------------
+@app.get("/locations", response_class=HTMLResponse)
+async def locations_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+    buckets = cluster_by_location(items)
+    sorted_buckets = sorted(buckets.items(), key=lambda kv: -len(kv[1]))
+    named = await annotate_location_names(sorted_buckets, max_lookup=30)
+
+    if not named:
+        body = """<div class="card"><p class="secondary">目前沒有帶 GPS 座標的照片,無法顯示拍攝地點。</p></div>"""
+        return HTMLResponse(page_shell("拍攝地點", body, active_tab="albums", back_href="/albums"))
+
+    markers_js = ",".join(
+        f'{{lat:{coords[0]},lng:{coords[1]},count:{len(group)},name:{json.dumps(name, ensure_ascii=False)},href:"/locations/view?lat={coords[0]}&lng={coords[1]}"}}'
+        for coords, group, name in named
+    )
+    avg_lat = sum(c[0] for c, _, _ in named) / len(named)
+    avg_lng = sum(c[1] for c, _, _ in named) / len(named)
+
+    rows_html = "".join(f"""
+    <a class="list-row tappable" href="/locations/view?lat={coords[0]}&lng={coords[1]}">
+        <span class="row-icon">📍</span>
+        <span class="row-label">{name}</span>
+        <span class="row-value">{len(group)} 張</span>
+        <span class="chevron">›</span>
+    </a>
+    """ for coords, group, name in named)
+
+    body = f"""
+    <p class="secondary" style="margin:0 6px 14px;">地圖與地名完全免費(OpenStreetMap),不需要任何付費金鑰。點地圖上的圖釘或下方清單,可以只看該地點拍的照片。</p>
+    <a class="btn-secondary" href="/locations/footprint" style="margin-bottom:14px;">🗺️ 看全部照片的足跡地圖(逐張顯示)</a>
+    <div id="loc-map" style="width:100%; height:280px; border-radius:14px; overflow:hidden; margin-bottom:14px;"></div>
+    <div class="list-group">{rows_html}</div>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+    (function() {{
+        var map = L.map('loc-map').setView([{avg_lat}, {avg_lng}], 6);
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '&copy; OpenStreetMap contributors', maxZoom: 18
+        }}).addTo(map);
+        var pts = [{markers_js}];
+        var bounds = [];
+        pts.forEach(function(p) {{
+            var m = L.marker([p.lat, p.lng]).addTo(map);
+            m.bindPopup(p.name + '(' + p.count + ' 張)<br><a href="' + p.href + '">查看照片</a>');
+            m.on('click', function() {{ window.location.href = p.href; }});
+            bounds.push([p.lat, p.lng]);
+        }});
+        if (bounds.length > 1) map.fitBounds(bounds, {{padding: [24, 24]}});
+    }})();
+    </script>
+    """
+    return HTMLResponse(page_shell(f"拍攝地點({len(named)})", body, active_tab="albums", back_href="/albums", include_lightbox=False))
+
+@app.get("/locations/footprint", response_class=HTMLResponse)
+async def locations_footprint(request: Request):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    items = [it for it in db_get_photos(sid) if it.get("latitude") is not None and it.get("longitude") is not None]
+
+    if not items:
+        body = """<div class="card"><p class="secondary">目前沒有帶 GPS 座標的照片。</p></div>"""
+        return HTMLResponse(page_shell("足跡地圖", body, active_tab="albums", back_href="/locations"))
+
+    LIMIT = 3000
+    shown = items[:LIMIT]
+    points_js = ",".join(
+        f'{{lat:{it["latitude"]},lng:{it["longitude"]},thumb:{json.dumps(it.get("thumbnail_url") or "", ensure_ascii=False)},name:{json.dumps(it.get("name") or "", ensure_ascii=False)}}}'
+        for it in shown
+    )
+    avg_lat = sum(it["latitude"] for it in shown) / len(shown)
+    avg_lng = sum(it["longitude"] for it in shown) / len(shown)
+    note = (
+        f"共 {len(items)} 張有 GPS 座標的照片,地圖上顯示最新的 {len(shown)} 張。"
+        if len(items) > LIMIT else f"共 {len(items)} 張有 GPS 座標的照片。"
+    )
+
+    body = f"""
+    <p class="secondary" style="margin:0 6px 14px;">{note}</p>
+    <div id="footprint-map" style="width:100%; height:70vh; border-radius:14px; overflow:hidden;"></div>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+    <script>
+    (function() {{
+        var map = L.map('footprint-map').setView([{avg_lat}, {avg_lng}], 5);
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '&copy; OpenStreetMap contributors', maxZoom: 18
+        }}).addTo(map);
+        var cluster = L.markerClusterGroup();
+        var pts = [{points_js}];
+        var bounds = [];
+        pts.forEach(function(p) {{
+            var m = L.marker([p.lat, p.lng]);
+            var img = p.thumb ? '<img src="' + p.thumb + '" style="width:120px;height:120px;object-fit:cover;border-radius:8px;display:block;margin-bottom:4px;">' : '';
+            m.bindPopup(img + (p.name || ''));
+            cluster.addLayer(m);
+            bounds.push([p.lat, p.lng]);
+        }});
+        map.addLayer(cluster);
+        if (bounds.length > 1) map.fitBounds(bounds, {{padding: [24, 24]}});
+    }})();
+    </script>
+    """
+    return HTMLResponse(page_shell("足跡地圖", body, active_tab="albums", back_href="/locations", include_lightbox=False))
+
+@app.get("/locations/view", response_class=HTMLResponse)
+async def location_view(request: Request, lat: float, lng: float):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    items = db_get_photos(sid)
+    key = (round(lat, LOCATION_PRECISION), round(lng, LOCATION_PRECISION))
+    matched = [it for it in items if it.get("latitude") is not None and it.get("longitude") is not None
+               and (round(it["latitude"], LOCATION_PRECISION), round(it["longitude"], LOCATION_PRECISION)) == key]
+    name = await reverse_geocode(lat, lng)
+
+    if not matched:
+        body = """<div class="card"><p class="secondary">這個地點目前沒有照片(可能已被刪除或分類條件改變)。</p></div>"""
+    else:
+        thumbs = "".join(lb_img_tag(it) for it in matched if it.get("thumbnail_url"))
+        body = f"""
+        <div class="card" style="text-align:center;">
+            <div class="stat-num">{len(matched)}</div>
+            <div class="secondary">張照片拍攝於此・<a class="pill-link" href="https://www.google.com/maps?q={lat},{lng}" target="_blank">在地圖上看</a></div>
+        </div>
+        <div class="photo-grid">{thumbs}</div>
+        """
+    return HTMLResponse(page_shell(f"📍 {name}", body, active_tab="albums", back_href="/locations"))
 
 # ---------------------------------------------------------------------------
 # 回憶影片
@@ -1151,7 +1645,7 @@ def month_label(month_key: str) -> str:
     except Exception:
         return month_key
 
-def render_gallery_html(items: list[dict], status: dict, visible_months: int) -> str:
+def render_gallery_html(items: list[dict], status: dict, visible_months: int, year_filter: str | None = None) -> str:
     scan_state = status.get("status", "idle"); scanned_count = status.get("count", 0)
     banners = ""
 
@@ -1161,6 +1655,10 @@ def render_gallery_html(items: list[dict], status: dict, visible_months: int) ->
         banners += f"""<div class="card banner-error">OneDrive 掃描時發生錯誤:{status.get("error")}</div>"""
     elif scan_state == "idle" and not items:
         banners += """<div class="card banner-info">尚未開始整理 OneDrive。<a class="pill-link" href="/scan/start">開始掃描</a></div>"""
+
+    all_items = items
+    if year_filter:
+        items = [it for it in items if (dt := parse_taken(it)) and str(dt.year) == year_filter or (not dt and year_filter == "未知年份")]
 
     refresh = 3 if scan_state == "scanning" else None
     empty_state = "" if items else """
@@ -1184,27 +1682,152 @@ def render_gallery_html(items: list[dict], status: dict, visible_months: int) ->
     <div class="photo-grid">{"".join(lb_img_tag(it) for it in group_items if it.get("thumbnail_url"))}</div>
     """ for mk, group_items in shown_groups)
 
+    more_qs = f"&year={year_filter}" if year_filter else ""
     load_more = f"""
-    <a class="btn-secondary" href="/gallery?months={visible_months + GALLERY_MONTHS_PER_PAGE}">顯示更早的照片(還有 {remaining_months} 個月份未顯示)</a>
+    <a class="btn-secondary" href="/gallery?months={visible_months + GALLERY_MONTHS_PER_PAGE}{more_qs}">顯示更早的照片(還有 {remaining_months} 個月份未顯示)</a>
     """ if remaining_months > 0 else ""
 
+    filter_banner = f"""
+    <div class="card banner-info" style="display:flex; align-items:center; justify-content:space-between;">
+        <span>目前只顯示 <b>{year_filter}</b> 的照片</span>
+        <a class="pill-link" href="/gallery">清除篩選</a>
+    </div>
+    """ if year_filter else ""
+
+    search_bar = """
+    <form class="inline-form" method="get" action="/search" style="margin-bottom:14px;">
+        <input class="apple-input" type="text" name="q" placeholder="🔍 搜尋檔名……" />
+    </form>
+    """
+    quick_links = """
+    <div style="margin-bottom:14px; display:flex; gap:8px; overflow-x:auto; white-space:nowrap;">
+        <a class="pill-link" href="/years">📅 年份總覽</a>
+        <a class="pill-link" href="/locations">📍 拍攝地點</a>
+        <a class="pill-link" href="/search">🔍 進階搜尋</a>
+        <a class="pill-link" href="/favorites">⭐ 我的最愛</a>
+    </div>
+    """
+
+    title = f"{year_filter} 的照片({len(items)})" if year_filter else f"我的圖庫({len(all_items)})"
     body = f"""
     {banners}
+    {filter_banner}
+    {search_bar}
+    {quick_links}
     <a class="btn-secondary" href="/scan/start" style="margin-bottom:14px;">重新掃描 OneDrive</a>
     {jump_nav}
     {sections}
     {empty_state}
     {load_more}
     """
-    return page_shell(f"我的圖庫({len(items)})", body, active_tab="gallery", meta_refresh=refresh)
+    return page_shell(title, body, active_tab="gallery", meta_refresh=refresh)
 
 @app.get("/gallery", response_class=HTMLResponse)
-async def gallery(request: Request, months: int = GALLERY_MONTHS_PER_PAGE):
+async def gallery(request: Request, months: int = GALLERY_MONTHS_PER_PAGE, year: str | None = None):
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
     if not sid or not token: return RedirectResponse("/login", status_code=303)
     status = SCAN_STATUS.get(sid, {"status": "idle", "count": 0})
-    return HTMLResponse(render_gallery_html(db_get_photos(sid), status, max(1, months)))
+    return HTMLResponse(render_gallery_html(db_get_photos(sid), status, max(1, months), year_filter=year))
+
+# ---------------------------------------------------------------------------
+# 年份總覽頁
+# ---------------------------------------------------------------------------
+def render_years_html(items: list[dict]) -> str:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for it in items:
+        dt = parse_taken(it)
+        grouped[str(dt.year) if dt else "未知年份"].append(it)
+
+    def year_sort_key(y: str):
+        return (-1 if y == "未知年份" else int(y))
+
+    years = sorted(grouped.keys(), key=year_sort_key, reverse=True)
+    if not years:
+        body = """<div class="card"><p class="secondary">圖庫還是空的,掃描 OneDrive 後這裡就會出現年份總覽。</p></div>"""
+        return page_shell("年份總覽", body, active_tab="gallery", back_href="/gallery")
+
+    cards = "".join(f"""
+    <a class="list-row tappable" href="/gallery?year={y}">
+        <span class="row-icon">🗓️</span>
+        <span class="row-label">{y if y == "未知年份" else y + " 年"}</span>
+        <span class="row-value">{len(grouped[y])} 張</span>
+        <span class="chevron">›</span>
+    </a>
+    """ for y in years)
+
+    preview_sections = "".join(f"""
+    <div class="section-title">{y if y == "未知年份" else y + " 年"}({len(grouped[y])} 張)</div>
+    <div class="photo-grid">{"".join(lb_img_tag(it) for it in grouped[y][:12] if it.get("thumbnail_url"))}</div>
+    <a class="pill-link" href="/gallery?year={y}" style="margin-bottom:8px;">看這一年全部照片</a>
+    """ for y in years)
+
+    body = f"""
+    <p class="secondary" style="margin:0 6px 14px;">依拍攝年份整理,點一個年份可以只看那一年的圖庫。</p>
+    <div class="list-group">{cards}</div>
+    {preview_sections}
+    """
+    return page_shell("年份總覽", body, active_tab="gallery", back_href="/gallery")
+
+@app.get("/years", response_class=HTMLResponse)
+async def years_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(render_years_html(db_get_photos(sid)))
+
+# ---------------------------------------------------------------------------
+# 圖庫搜尋(檔名關鍵字 + 年份/月份篩選)
+# ---------------------------------------------------------------------------
+def render_search_html(items: list[dict], q: str, year: str, month: str) -> str:
+    results = items
+    if q:
+        ql = q.strip().lower()
+        results = [it for it in results if ql in (it.get("name") or "").lower()]
+    if year:
+        results = [it for it in results if (dt := parse_taken(it)) and str(dt.year) == year]
+    if month:
+        results = [it for it in results if (dt := parse_taken(it)) and f"{dt.month:02d}" == month]
+
+    year_options = sorted({str((dt.year)) for it in items if (dt := parse_taken(it))}, reverse=True)
+    year_select = "".join(f'<option value="{y}"{" selected" if y == year else ""}>{y} 年</option>' for y in year_options)
+    month_select = "".join(f'<option value="{m:02d}"{" selected" if f"{m:02d}" == month else ""}>{m} 月</option>' for m in range(1, 13))
+
+    q_escaped = (q or "").replace('"', "&quot;")
+    form = f"""
+    <form class="inline-form" method="get" action="/search">
+        <input class="apple-input" type="text" name="q" placeholder="搜尋檔名……" value="{q_escaped}" />
+        <div class="btn-row">
+            <select class="apple-select" name="year"><option value="">不限年份</option>{year_select}</select>
+            <select class="apple-select" name="month"><option value="">不限月份</option>{month_select}</select>
+        </div>
+        <button type="submit" class="btn-primary">搜尋</button>
+    </form>
+    """
+
+    searched = bool(q or year or month)
+    if not searched:
+        result_html = """<div class="card"><p class="secondary">輸入檔名關鍵字,或選擇年份/月份,就能快速找到照片。</p></div>"""
+    elif not results:
+        result_html = """<div class="card"><p class="secondary">沒有找到符合條件的照片,換個關鍵字試試看。</p></div>"""
+    else:
+        result_html = f"""
+        <div class="section-title">搜尋結果({len(results)} 張)</div>
+        <div class="photo-grid">{"".join(lb_img_tag(it) for it in results[:300] if it.get("thumbnail_url"))}</div>
+        """
+        if len(results) > 300:
+            result_html += """<p class="secondary" style="text-align:center;">結果太多,只顯示前 300 張,建議加上更明確的關鍵字或年份/月份。</p>"""
+
+    body = f"""
+    <div class="card">{form}</div>
+    {result_html}
+    """
+    return page_shell("圖庫搜尋", body, active_tab="gallery", back_href="/gallery")
+
+@app.get("/search", response_class=HTMLResponse)
+async def search_page(request: Request, q: str = "", year: str = "", month: str = ""):
+    sid = request.session.get("sid")
+    if not sid: return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(render_search_html(db_get_photos(sid), q, year, month))
 
 @app.get("/photos")
 async def photos(request: Request, max_depth: int = 6):
