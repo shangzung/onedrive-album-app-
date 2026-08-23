@@ -328,47 +328,57 @@ init_db()
 def _msal_app() -> msal.ConfidentialClientApplication:
     return msal.ConfidentialClientApplication(client_id=CLIENT_ID, client_credential=CLIENT_SECRET, authority=AUTHORITY)
 
-def _store_ms_token(sid: str, result: dict):
+def _store_ms_token(request: Request, sid: str, result: dict):
     TOKEN_STORE.setdefault(sid, {})
     TOKEN_STORE[sid]["access_token"] = result["access_token"]
     if result.get("refresh_token"):
         TOKEN_STORE[sid]["refresh_token"] = result["refresh_token"]
     expires_in = result.get("expires_in", 3600)
     TOKEN_STORE[sid]["expires_at"] = datetime.utcnow() + timedelta(seconds=int(expires_in) - 120)
+    # 重點:refresh_token 額外存進瀏覽器 session cookie。
+    # 伺服器重新部署(main.py 更新)後,記憶體內的 TOKEN_STORE 會被清空,
+    # 但瀏覽器帶著的 session cookie 不會變,靠這個就能自動換發新的 access_token,不必重新登入、也不必手動重新掃描。
+    if TOKEN_STORE[sid].get("refresh_token"):
+        request.session["ms_refresh_token"] = TOKEN_STORE[sid]["refresh_token"]
 
-def _store_google_token(sid: str, data: dict):
+def _store_google_token(request: Request, sid: str, data: dict):
     TOKEN_STORE.setdefault(sid, {})
     TOKEN_STORE[sid]["google_access_token"] = data["access_token"]
     if data.get("refresh_token"):
         TOKEN_STORE[sid]["google_refresh_token"] = data["refresh_token"]
     expires_in = data.get("expires_in", 3600)
     TOKEN_STORE[sid]["google_expires_at"] = datetime.utcnow() + timedelta(seconds=int(expires_in) - 120)
+    if TOKEN_STORE[sid].get("google_refresh_token"):
+        request.session["google_refresh_token"] = TOKEN_STORE[sid]["google_refresh_token"]
 
-async def get_ms_token(sid: str | None) -> str | None:
-    """回傳有效的 OneDrive access_token,過期前 2 分鐘自動用 refresh_token 換新。"""
-    if not sid or sid not in TOKEN_STORE:
+async def get_ms_token(request: Request, sid: str | None) -> str | None:
+    """回傳有效的 OneDrive access_token,過期前 2 分鐘自動用 refresh_token 換新。
+    若伺服器程序重啟導致記憶體內快取遺失,會改用 session cookie 裡保存的 refresh_token 自動換新,
+    使用者不需要重新登入,照片資料庫也就不需要重新整個掃描一次。"""
+    if not sid:
         return None
-    entry = TOKEN_STORE[sid]
+    entry = TOKEN_STORE.get(sid) or {}
     if entry.get("access_token") and entry.get("expires_at") and datetime.utcnow() < entry["expires_at"]:
         return entry["access_token"]
-    refresh_token = entry.get("refresh_token")
+    refresh_token = entry.get("refresh_token") or request.session.get("ms_refresh_token")
     if not refresh_token:
         return entry.get("access_token")
     result = _msal_app().acquire_token_by_refresh_token(refresh_token, scopes=SCOPES)
     if "access_token" not in result:
         TOKEN_STORE.pop(sid, None)
+        request.session.pop("ms_refresh_token", None)
         return None
-    _store_ms_token(sid, result)
+    _store_ms_token(request, sid, result)
     return result["access_token"]
 
-async def get_google_token(sid: str | None) -> str | None:
-    """回傳有效的 Google access_token,過期前 2 分鐘自動用 refresh_token 換新。"""
-    if not sid or sid not in TOKEN_STORE:
+async def get_google_token(request: Request, sid: str | None) -> str | None:
+    """回傳有效的 Google access_token,過期前 2 分鐘自動用 refresh_token 換新(同樣會用 session cookie 內的備援 refresh_token)。"""
+    if not sid:
         return None
-    entry = TOKEN_STORE[sid]
+    entry = TOKEN_STORE.get(sid) or {}
     if entry.get("google_access_token") and entry.get("google_expires_at") and datetime.utcnow() < entry["google_expires_at"]:
         return entry["google_access_token"]
-    refresh_token = entry.get("google_refresh_token")
+    refresh_token = entry.get("google_refresh_token") or request.session.get("google_refresh_token")
     if not refresh_token:
         return entry.get("google_access_token")
     async with httpx.AsyncClient(timeout=20) as client:
@@ -378,9 +388,10 @@ async def get_google_token(sid: str | None) -> str | None:
         })
     data = resp.json()
     if "access_token" not in data:
-        entry.pop("google_access_token", None)
+        TOKEN_STORE.setdefault(sid, {}).pop("google_access_token", None)
+        request.session.pop("google_refresh_token", None)
         return None
-    _store_google_token(sid, data)
+    _store_google_token(request, sid, data)
     return data["access_token"]
 
 # ---------------------------------------------------------------------------
@@ -389,8 +400,10 @@ async def get_google_token(sid: str | None) -> str | None:
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     sid = request.session.get("sid")
-    onedrive_connected = bool(sid and TOKEN_STORE.get(sid, {}).get("access_token"))
-    google_connected = bool(sid and TOKEN_STORE.get(sid, {}).get("google_access_token"))
+    onedrive_token = await get_ms_token(request, sid)
+    google_token = await get_google_token(request, sid)
+    onedrive_connected = bool(onedrive_token)
+    google_connected = bool(google_token)
 
     if not onedrive_connected:
         body = """
@@ -403,6 +416,8 @@ async def home(request: Request):
         """
         return HTMLResponse(page_shell("我的相簿", body, active_tab="home", show_tabbar=False))
 
+    # 伺服器重啟後本機資料庫是空的,但如果 OneDrive 上有備份,就悄悄自動還原,不必使用者手動重新掃描一次
+    await restore_db_from_onedrive(sid, onedrive_token)
     photo_count = len(db_get_photos(sid))
     
     if google_connected:
@@ -512,7 +527,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     if "access_token" not in result: return JSONResponse({"error": result.get("error"), "description": result.get("error_description")}, status_code=400)
     sid = request.session.get("sid")
     if not sid: return JSONResponse({"error": "missing_session"}, status_code=400)
-    _store_ms_token(sid, result)
+    _store_ms_token(request, sid, result)
     await restore_db_from_onedrive(sid, result["access_token"])
     return RedirectResponse("/")
 
@@ -562,13 +577,13 @@ async def google_callback(request: Request, code: str | None = None, state: str 
     
     sid = request.session.get("sid")
     if not sid: return JSONResponse({"error": "missing_session"}, status_code=400)
-    _store_google_token(sid, data)
+    _store_google_token(request, sid, data)
     return RedirectResponse("/google/sync/options")
 
 @app.get("/google/sync/options", response_class=HTMLResponse)
 async def google_sync_options(request: Request):
     sid = request.session.get("sid")
-    token = await get_google_token(sid)
+    token = await get_google_token(request, sid)
     if not token: return RedirectResponse("/google/login")
     
     current_year = datetime.now().year
@@ -597,8 +612,8 @@ async def google_sync_options(request: Request):
 @app.post("/google/sync/start")
 async def google_sync_start(request: Request, start_date: str = Form(""), end_date: str = Form("")):
     sid = request.session.get("sid")
-    google_token = await get_google_token(sid)
-    onedrive_token = await get_ms_token(sid)
+    google_token = await get_google_token(request, sid)
+    onedrive_token = await get_ms_token(request, sid)
     if not google_token: return RedirectResponse("/google/login")
 
     GOOGLE_IMPORT_STATUS[sid] = {"status": "importing", "count": 0, "total": "計算中..."}
@@ -880,7 +895,7 @@ def start_scan_if_needed(sid: str, token: str):
 @app.get("/scan/start")
 async def scan_start(request: Request):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(request, sid)
     if not token: return JSONResponse({"error": "not_logged_in"}, status_code=401)
     start_scan_if_needed(sid, token)
     return RedirectResponse("/gallery")
@@ -947,7 +962,7 @@ async def duplicates_view(request: Request, threshold: int = DEFAULT_DUP_THRESHO
 @app.post("/duplicates/auto-clean")
 async def auto_clean_duplicates(request: Request, threshold: int = Form(DEFAULT_DUP_THRESHOLD)):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(request, sid)
     if not sid or not token: return RedirectResponse("/login")
 
     groups = find_duplicate_groups(db_get_photos(sid), threshold=threshold)
@@ -1014,6 +1029,8 @@ CLEANUP_BATCH_SIZE = 50
 async def cleanup_view(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
+    token = await get_ms_token(request, sid)
+    await restore_db_from_onedrive(sid, token)
     
     items = db_get_photos(sid)
     cleanup_data = get_cleanup_items(items)
@@ -1113,7 +1130,7 @@ def _safe_cleanup_redirect(redirect_to: str | None) -> str:
 @app.post("/cleanup/batch-move")
 async def cleanup_batch_move(request: Request):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(request, sid)
     if not sid or not token: return RedirectResponse("/login")
 
     form = await request.form()
@@ -1261,6 +1278,8 @@ def render_albums_html(items: list[dict]) -> str:
 async def albums(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
+    token = await get_ms_token(request, sid)
+    await restore_db_from_onedrive(sid, token)
     return HTMLResponse(render_albums_html(db_get_photos(sid)))
 
 # ---------------------------------------------------------------------------
@@ -1398,13 +1417,15 @@ def render_memories_html(items: list[dict]) -> str:
 async def memories(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
+    token = await get_ms_token(request, sid)
+    await restore_db_from_onedrive(sid, token)
     return HTMLResponse(render_memories_html(db_get_photos(sid)))
 
 @app.post("/memories/render")
 async def memories_render(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(request, sid)
     form = await request.form(); ids = [i for i in str(form.get("ids", "")).split(",") if i]
     if len(ids) < 2: return JSONResponse({"error": "photos_not_enough"}, status_code=400)
     all_photos = {p["id"]: p for p in db_get_photos(sid)}; items = [all_photos[i] for i in ids if i in all_photos]
@@ -1475,7 +1496,9 @@ def render_gallery_html(items: list[dict], status: dict, google_status: dict) ->
         banners += f"""<div class="card banner-warning">正在背景整理你的 OneDrive,目前已掃到 {scanned_count} 張……</div>"""
     elif scan_state == "error": 
         banners += f"""<div class="card banner-error">OneDrive 掃描時發生錯誤:{status.get("error")}</div>"""
-    elif scan_state == "idle": 
+    elif scan_state == "idle" and not items:
+        # 只有真的完全沒有照片資料時才提示要開始掃描；
+        # 若已有資料(例如伺服器重啟後自動從 OneDrive 備份還原回來),不要再誤導使用者以為需要重新掃描一次。
         banners += """<div class="card banner-info">尚未開始整理 OneDrive。<a class="pill-link" href="/scan/start">開始掃描</a></div>"""
 
     if google_state == "importing": 
@@ -1507,15 +1530,16 @@ def render_gallery_html(items: list[dict], status: dict, google_status: dict) ->
 @app.get("/gallery", response_class=HTMLResponse)
 async def gallery(request: Request):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(request, sid)
     if not sid or not token: return RedirectResponse("/login")
+    await restore_db_from_onedrive(sid, token)
     status = SCAN_STATUS.get(sid, {"status": "idle", "count": 0})
     return HTMLResponse(render_gallery_html(db_get_photos(sid), status, GOOGLE_IMPORT_STATUS.get(sid, {"status": "idle"})))
 
 @app.get("/photos")
 async def photos(request: Request, max_depth: int = 6):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(request, sid)
     if not token: return JSONResponse({"error": "not_logged_in", "hint": "先前往 /login"}, status_code=401)
     try: return {"count": len(items := await fetch_all_media(token, max_depth=max_depth)), "items": items}
     except httpx.HTTPStatusError as e: return JSONResponse({"error": "graph_api_error", "detail": e.response.text}, status_code=e.response.status_code)
