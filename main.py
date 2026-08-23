@@ -992,70 +992,122 @@ BACKUP_FILENAME = "photos_backup.json"
 
 # 還原結果快取（給首頁顯示用，避免使用者完全不知道發生什麼事）
 RESTORE_STATUS: dict[str, dict] = {}
+# 同一時間只允許一個備份，避免 upload session 互相踩踏 + 429
+_BACKUP_LOCKS: dict[str, asyncio.Lock] = {}
+_BACKUP_RUNNING: set[str] = set()
 
-async def backup_db_to_onedrive(sid: str, token: str | None) -> bool:
+def _backup_lock_for(sid: str) -> asyncio.Lock:
+    if sid not in _BACKUP_LOCKS:
+        _BACKUP_LOCKS[sid] = asyncio.Lock()
+    return _BACKUP_LOCKS[sid]
+
+async def backup_db_to_onedrive(sid: str, token: str | None, force: bool = False) -> bool:
     """
     備份到 OneDrive。
-    注意：Graph 簡單 PUT 上限約 4MB；超過時改用 upload session 分塊上傳，
-    否則會一直停在舊的 ~2000 張備份。
+    - Graph 簡單 PUT 上限約 4MB，超過改 upload session 分塊上傳
+    - 同一 sid 同時只跑一個備份；掃描中若已有備份在跑會直接跳過（除非 force）
     """
     if not token:
         return False
-    rows = db_get_photos(sid)
-    if not rows:
+    if sid in _BACKUP_RUNNING and not force:
         return False
-    payload = json.dumps(rows, ensure_ascii=False).encode("utf-8")
-    size = len(payload)
-    headers_auth = {"Authorization": f"Bearer {token}"}
-    try:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            if size < 3_500_000:
-                # 小檔：直接 PUT
-                url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
-                resp = await client.put(
-                    url,
-                    headers={**headers_auth, "Content-Type": "application/json"},
-                    content=payload,
-                )
-                resp.raise_for_status()
-            else:
-                # 大檔：建立 upload session 後分塊上傳（每塊 3.2MB，需為 320KiB 倍數）
-                session_url = (
-                    f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/createUploadSession"
-                )
-                sess = await client.post(
-                    session_url,
-                    headers={**headers_auth, "Content-Type": "application/json"},
-                    json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
-                )
-                sess.raise_for_status()
-                upload_url = sess.json()["uploadUrl"]
-                chunk_size = 320 * 1024 * 10  # 3.2 MB
-                start = 0
-                while start < size:
-                    end = min(start + chunk_size, size) - 1
-                    chunk = payload[start : end + 1]
-                    put_headers = {
-                        "Content-Length": str(len(chunk)),
-                        "Content-Range": f"bytes {start}-{end}/{size}",
-                    }
-                    for attempt in range(4):
-                        r = await client.put(upload_url, headers=put_headers, content=chunk, timeout=120)
-                        if r.status_code in (200, 201, 202):
-                            break
-                        if r.status_code == 416:
-                            # 範圍不對，重頭來
-                            break
-                        await asyncio.sleep(1 + attempt)
-                    else:
-                        raise RuntimeError(f"分塊上傳失敗 HTTP {r.status_code}: {r.text[:300]}")
-                    start = end + 1
+
+    lock = _backup_lock_for(sid)
+    if lock.locked() and not force:
+        return False
+
+    async with lock:
+        if sid in _BACKUP_RUNNING and not force:
+            return False
+        _BACKUP_RUNNING.add(sid)
+        try:
+            rows = db_get_photos(sid)
+            if not rows:
+                return False
+            payload = json.dumps(rows, ensure_ascii=False).encode("utf-8")
+            size = len(payload)
+            headers_auth = {"Authorization": f"Bearer {token}"}
+
+            async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+                # 429 時重試 createUploadSession / PUT
+                async def _put_simple():
+                    url = f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/content"
+                    for attempt in range(5):
+                        resp = await client.put(
+                            url,
+                            headers={**headers_auth, "Content-Type": "application/json"},
+                            content=payload,
+                        )
+                        if resp.status_code == 429:
+                            await asyncio.sleep(int(resp.headers.get("Retry-After", 5 + attempt * 3)))
+                            continue
+                        resp.raise_for_status()
+                        return
+                    resp.raise_for_status()
+
+                async def _put_chunked():
+                    session_url = (
+                        f"{GRAPH_BASE}/me/drive/root:/{BACKUP_FOLDER_NAME}/{BACKUP_FILENAME}:/createUploadSession"
+                    )
+                    upload_url = None
+                    for attempt in range(5):
+                        sess = await client.post(
+                            session_url,
+                            headers={**headers_auth, "Content-Type": "application/json"},
+                            json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+                        )
+                        if sess.status_code == 429:
+                            await asyncio.sleep(int(sess.headers.get("Retry-After", 5 + attempt * 3)))
+                            continue
+                        sess.raise_for_status()
+                        upload_url = sess.json()["uploadUrl"]
+                        break
+                    if not upload_url:
+                        raise RuntimeError("無法建立 upload session")
+
+                    chunk_size = 320 * 1024 * 10  # 3.2 MB（320KiB 倍數）
+                    start = 0
+                    while start < size:
+                        end = min(start + chunk_size, size) - 1
+                        chunk = payload[start : end + 1]
+                        put_headers = {
+                            "Content-Length": str(len(chunk)),
+                            "Content-Range": f"bytes {start}-{end}/{size}",
+                        }
+                        for attempt in range(5):
+                            r = await client.put(upload_url, headers=put_headers, content=chunk, timeout=180)
+                            if r.status_code in (200, 201, 202):
+                                break
+                            if r.status_code == 429:
+                                await asyncio.sleep(int(r.headers.get("Retry-After", 5 + attempt * 3)))
+                                continue
+                            if r.status_code in (404, 410):
+                                # session 失效，重建一次
+                                raise RuntimeError(f"upload session 失效 HTTP {r.status_code}")
+                            if attempt == 4:
+                                raise RuntimeError(f"分塊上傳失敗 HTTP {r.status_code}: {r.text[:300]}")
+                            await asyncio.sleep(1 + attempt)
+                        start = end + 1
+
+                if size < 3_500_000:
+                    await _put_simple()
+                else:
+                    try:
+                        await _put_chunked()
+                    except Exception as e1:
+                        # 失敗就整段重試一次（新 session）
+                        print(f"分塊上傳重試中 sid={sid}: {e1}")
+                        await asyncio.sleep(3)
+                        await _put_chunked()
+
             save_scan_state(sid, photo_count=len(rows))
             print(f"備份成功 sid={sid} count={len(rows)} bytes={size}")
             return True
-    except Exception as e:
-        print(f"備份 photos.db 到 OneDrive 失敗(sid={sid}) count={len(rows)} bytes={size}: {e}")
-        return False
+        except Exception as e:
+            print(f"備份 photos.db 到 OneDrive 失敗(sid={sid}): {e}")
+            return False
+        finally:
+            _BACKUP_RUNNING.discard(sid)
 
 async def restore_db_from_onedrive(sid: str, token: str | None, force: bool = False) -> dict:
     """
@@ -1217,7 +1269,8 @@ async def _scan_full(sid: str, token: str, existing_photos: dict) -> tuple[int, 
         }
         if count % 100 == 0:
             print(f"全量掃描進度 sid={sid} processed={count} db_unique={total}")
-        if count % 300 == 0:
+        # 降低備份頻率，避免 upload session 互相衝突；結束時會再 force 備份一次
+        if count % 800 == 0:
             await backup_db_to_onedrive(sid, token)
 
     new_delta_link = None
@@ -1324,11 +1377,11 @@ async def run_background_scan(sid: str, token: str, force_full: bool = False):
             "mode": mode,
         }
         print(f"掃描完成 sid={sid} mode={mode} processed={count} db={final_count}")
-        await backup_db_to_onedrive(sid, token)
+        await backup_db_to_onedrive(sid, token, force=True)
     except Exception as e:
         SCAN_STATUS[sid] = {"status": "error", "error": str(e)}
         print(f"掃描失敗 sid={sid}: {e}")
-        await backup_db_to_onedrive(sid, token)
+        await backup_db_to_onedrive(sid, token, force=True)
 
 
 def start_scan_if_needed(sid: str, token: str, force_full: bool = False):
@@ -1667,7 +1720,7 @@ async def api_delete_photo(request: Request, id: str = Form(...)):
     conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, id))
     conn.commit()
     conn.close()
-    asyncio.create_task(backup_db_to_onedrive(sid, token))
+    # 單張刪除不立即備份，避免與掃描備份互相踩踏；下次掃描結束會完整備份
     return JSONResponse({"success": True})
 
 @app.post("/api/photo/favorite")
