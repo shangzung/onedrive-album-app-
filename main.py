@@ -243,7 +243,8 @@ LIGHTBOX_ASSETS = """
 <style>
 #lightbox-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 9999; align-items: center; justify-content: center; flex-direction: column; padding: calc(16px + env(safe-area-inset-top,0px)) 12px calc(16px + env(safe-area-inset-bottom,0px)); }
 #lightbox-overlay.active { display: flex; }
-#lightbox-img { width: 94vw; height: 76vh; max-width: 1100px; border-radius: 10px; object-fit: contain; }
+#lightbox-img, #lightbox-video { width: 94vw; height: 76vh; max-width: 1100px; border-radius: 10px; object-fit: contain; background: #000; }
+#lightbox-video { display: none; }
 #lightbox-caption { color: #fff; margin-top: 12px; font-size: 13px; text-align: center; opacity: 0.85; }
 .lb-nav { position: fixed; top: 50%; transform: translateY(-50%); background: rgba(120,120,128,0.32); color: #fff; border: none; font-size: 22px; width: 42px; height: 42px; border-radius: 50%; cursor: pointer; }
 #lb-prev { left: 12px; } #lb-next { right: 12px; }
@@ -252,6 +253,7 @@ LIGHTBOX_ASSETS = """
 .lb-top-btn.active { background: var(--warning); color: #000; }
 #lb-fav-btn { right: 60px; }
 #lb-del-btn { right: 104px; background: rgba(255,59,48,0.5); }
+.video-badge { position: absolute; right: 5px; bottom: 5px; font-size: 14px; background: rgba(0,0,0,0.55); color: #fff; border-radius: 6px; padding: 2px 6px; line-height: 1.3; backdrop-filter: blur(8px); }
 </style>
 <div id="lightbox-overlay">
     <button id="lb-close" onclick="closeLightbox()">&times;</button>
@@ -259,6 +261,7 @@ LIGHTBOX_ASSETS = """
     <button id="lb-del-btn" class="lb-top-btn" onclick="quickDeletePhoto(this)">&#128465;</button>
     <button id="lb-prev" class="lb-nav" onclick="navLightbox(-1)">&#8249;</button>
     <img id="lightbox-img" src="" />
+    <video id="lightbox-video" controls playsinline preload="metadata"></video>
     <div id="lightbox-caption"></div>
     <button id="lb-next" class="lb-nav" onclick="navLightbox(1)">&#8250;</button>
 </div>
@@ -268,8 +271,25 @@ function initLightbox() { lbThumbs = Array.from(document.querySelectorAll('.lb-t
 function openLightbox(i) { lbIndex = i; showLightbox(); document.getElementById('lightbox-overlay').classList.add('active'); }
 function showLightbox() {
     const t = lbThumbs[lbIndex];
-    document.getElementById('lightbox-img').src = t.dataset.full || t.src;
-    document.getElementById('lightbox-caption').textContent = (t.dataset.name || '') + (t.dataset.taken ? '  ・  ' + t.dataset.taken : '');
+    const isVideo = t.dataset.video === '1';
+    const imgEl = document.getElementById('lightbox-img');
+    const vidEl = document.getElementById('lightbox-video');
+    // 切換時先停掉上一部影片
+    try { vidEl.pause(); vidEl.removeAttribute('src'); vidEl.load(); } catch (e) {}
+    if (isVideo) {
+        imgEl.style.display = 'none';
+        imgEl.removeAttribute('src');
+        vidEl.style.display = 'block';
+        // 透過後端代理取得可播放網址（帶登入狀態）
+        vidEl.src = '/api/media/' + encodeURIComponent(t.dataset.id || '') + '/stream';
+        vidEl.play().catch(() => {});
+    } else {
+        vidEl.style.display = 'none';
+        imgEl.style.display = 'block';
+        imgEl.src = t.dataset.full || t.src;
+    }
+    const kind = isVideo ? '🎬 ' : '';
+    document.getElementById('lightbox-caption').textContent = kind + (t.dataset.name || '') + (t.dataset.taken ? '  ・  ' + t.dataset.taken : '');
     const favBtn = document.getElementById('lb-fav-btn');
     favBtn.dataset.id = t.dataset.id || '';
     const isFav = t.dataset.fav === '1';
@@ -278,7 +298,11 @@ function showLightbox() {
     document.getElementById('lb-del-btn').dataset.id = t.dataset.id || '';
 }
 function navLightbox(delta) { if (lbThumbs.length === 0) return; lbIndex = (lbIndex + delta + lbThumbs.length) % lbThumbs.length; showLightbox(); }
-function closeLightbox() { document.getElementById('lightbox-overlay').classList.remove('active'); }
+function closeLightbox() {
+    const vidEl = document.getElementById('lightbox-video');
+    try { vidEl.pause(); vidEl.removeAttribute('src'); vidEl.load(); } catch (e) {}
+    document.getElementById('lightbox-overlay').classList.remove('active');
+}
 document.addEventListener('keydown', (e) => { if (!document.getElementById('lightbox-overlay').classList.contains('active')) return; if (e.key === 'Escape') closeLightbox(); if (e.key === 'ArrowLeft') navLightbox(-1); if (e.key === 'ArrowRight') navLightbox(1); });
 document.addEventListener('DOMContentLoaded', initLightbox);
 
@@ -384,11 +408,15 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
     taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
     item_id = (item.get("id") or "").replace('"', "&quot;")
     is_fav = bool(item.get("favorite"))
+    mime = (item.get("mime_type") or item.get("mimeType") or "").lower()
+    is_video = mime.startswith("video/") or name.lower().endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm"))
     badge_html = f'<div class="photo-badge">{badge}</div>' if badge else ""
+    video_badge = '<div class="video-badge">▶</div>' if is_video else ""
     return f"""
     <div class="photo-tile" data-id="{item_id}">
-        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" data-id="{item_id}" data-fav="{"1" if is_fav else "0"}" loading="lazy" />
+        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" data-id="{item_id}" data-fav="{"1" if is_fav else "0"}" data-video="{"1" if is_video else "0"}" loading="lazy" />
         {badge_html}
+        {video_badge}
         <div class="tile-actions">
             <button type="button" class="tile-btn fav-btn{" active" if is_fav else ""}" data-id="{item_id}" onclick="event.stopPropagation(); toggleFavoritePhoto(this);" title="加入最愛">{"&#9733;" if is_fav else "&#9734;"}</button>
             <button type="button" class="tile-btn del-btn" data-id="{item_id}" onclick="event.stopPropagation(); quickDeletePhoto(this);" title="刪除">&#128465;</button>
@@ -1722,6 +1750,38 @@ async def api_delete_photo(request: Request, id: str = Form(...)):
     conn.close()
     # 單張刪除不立即備份，避免與掃描備份互相踩踏；下次掃描結束會完整備份
     return JSONResponse({"success": True})
+
+@app.get("/api/media/{item_id}/stream")
+async def api_media_stream(request: Request, item_id: str):
+    """
+    影片/原檔串流：向 Graph 取 @microsoft.graph.downloadUrl 後 302 轉址。
+    瀏覽器 <video src> 可直接播放（downloadUrl 為預簽章，不需再帶 Bearer）。
+    """
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return RedirectResponse("/login", status_code=303)
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            meta = await client.get(
+                f"{GRAPH_BASE}/me/drive/items/{item_id}?$select=id,@microsoft.graph.downloadUrl,file",
+                headers=headers,
+            )
+            if meta.status_code == 404:
+                return JSONResponse({"error": "not_found"}, status_code=404)
+            meta.raise_for_status()
+            data = meta.json()
+            download_url = data.get("@microsoft.graph.downloadUrl")
+            if download_url:
+                return RedirectResponse(download_url, status_code=302)
+            # 沒有 downloadUrl 時退回 /content（讓瀏覽器跟著轉）
+            return RedirectResponse(
+                f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
+                status_code=302,
+            )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
 
 @app.post("/api/photo/favorite")
 async def api_toggle_favorite(request: Request, id: str = Form(...)):
