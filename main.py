@@ -478,11 +478,12 @@ async function batchDeleteSelected() {{
 """
 
 def lb_img_tag(item: dict, badge: str | None = None) -> str:
-    thumb = item.get("thumbnail_url") or item.get("thumbnailUrl") or ""
-    full = item.get("thumbnail_large_url") or item.get("thumbnailLargeUrl") or item.get("web_url") or item.get("webUrl") or thumb
+    item_id = (item.get("id") or "").replace('"', "&quot;")
+    # 一律走後端代理，避免 Graph 暫時縮圖網址過期導致全黑
+    thumb = f"/api/media/{item_id}/thumb" if item_id else ""
+    full = f"/api/media/{item_id}/thumb?size=large" if item_id else ""
     name = (item.get("name") or "").replace('"', "&quot;")
     taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
-    item_id = (item.get("id") or "").replace('"', "&quot;")
     is_fav = bool(item.get("favorite"))
     mime = (item.get("mime_type") or item.get("mimeType") or "").lower()
     is_video = mime.startswith("video/") or name.lower().endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm"))
@@ -1827,6 +1828,77 @@ async def api_delete_photo(request: Request, id: str = Form(...)):
     # 單張刪除不立即備份，避免與掃描備份互相踩踏；下次掃描結束會完整備份
     return JSONResponse({"success": True})
 
+
+@app.get("/api/media/{item_id}/thumb")
+async def api_media_thumb(request: Request, item_id: str, size: str = "medium"):
+    """
+    縮圖代理：即時向 Graph 要縮圖並轉發給瀏覽器，
+    避免預存的暫時網址過期導致圖庫全黑。
+    size: small | medium | large
+    """
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return RedirectResponse("/login", status_code=303)
+
+    size = size if size in ("small", "medium", "large") else "medium"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            # 先取縮圖清單
+            resp = await client.get(
+                f"{GRAPH_BASE}/me/drive/items/{item_id}/thumbnails",
+                headers=headers,
+            )
+            if resp.status_code == 404:
+                return JSONResponse({"error": "not_found"}, status_code=404)
+            if resp.status_code != 200:
+                # fallback: 直接取 content（較慢但可用）
+                content_resp = await client.get(
+                    f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
+                    headers=headers,
+                )
+                if content_resp.status_code == 200:
+                    return StreamingResponse(
+                        io.BytesIO(content_resp.content),
+                        media_type=content_resp.headers.get("content-type", "image/jpeg"),
+                        headers={"Cache-Control": "private, max-age=3600"},
+                    )
+                return JSONResponse({"error": "thumb_failed"}, status_code=502)
+
+            data = resp.json()
+            thumbs = data.get("value") or []
+            if not thumbs:
+                return JSONResponse({"error": "no_thumbnails"}, status_code=404)
+
+            t = thumbs[0]
+            # 優先指定 size，否則依序降級
+            url = None
+            for s in (size, "large", "medium", "small"):
+                if s in t and t[s].get("url"):
+                    url = t[s]["url"]
+                    break
+            if not url:
+                return JSONResponse({"error": "no_url"}, status_code=404)
+
+            # 下載實際圖片並回傳（Graph 縮圖 url 通常不需再帶 token）
+            img_resp = await client.get(url)
+            if img_resp.status_code != 200:
+                return JSONResponse({"error": "fetch_failed"}, status_code=502)
+
+            return StreamingResponse(
+                io.BytesIO(img_resp.content),
+                media_type=img_resp.headers.get("content-type", "image/jpeg"),
+                headers={
+                    "Cache-Control": "private, max-age=86400",
+                    "Content-Length": str(len(img_resp.content)),
+                },
+            )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
 @app.get("/api/media/{item_id}/stream")
 async def api_media_stream(request: Request, item_id: str):
     """
@@ -1974,7 +2046,7 @@ async def favorites_page(request: Request):
     else:
         body = f"""
         <p class="secondary" style="margin:0 6px 14px;">共 {len(items)} 張最愛照片。</p>
-        <div class="photo-grid">{"".join(lb_img_tag(it) for it in items if it.get("thumbnail_url"))}</div>
+        <div class="photo-grid">{"".join(lb_img_tag(it) for it in items if it.get("id"))}</div>
         """
     return HTMLResponse(page_shell("我的最愛", body, active_tab="more", back_href="/more"))
 
@@ -2033,7 +2105,7 @@ async def storage_page(request: Request):
     <div class="section-title">依年份佔用空間</div>
     <div class="list-group">{year_rows or '<div class="list-row"><span class="secondary">尚無資料</span></div>'}</div>
     <div class="section-title">最大的檔案(前 12 個,適合檢查要不要刪)</div>
-    <div class="photo-grid">{"".join(lb_img_tag(it, badge=format_bytes(it.get("size") or 0)) for it in largest if it.get("thumbnail_url"))}</div>
+    <div class="photo-grid">{"".join(lb_img_tag(it, badge=format_bytes(it.get("size") or 0)) for it in largest if it.get("id"))}</div>
     """
     return HTMLResponse(page_shell("儲存空間統計", body, active_tab="more", back_href="/more"))
 
@@ -2122,7 +2194,7 @@ async def render_albums_html(items: list[dict]) -> str:
     photos_only = [it for it in items if it["id"] not in exclude_ids]
 
     events = cluster_events(photos_only); location_buckets = cluster_by_location(photos_only)
-    def thumb_row(group, limit=12): return "".join(lb_img_tag(it) for it in group[:limit] if it.get("thumbnail_url"))
+    def thumb_row(group, limit=12): return "".join(lb_img_tag(it) for it in group[:limit] if it.get("id"))
 
     events_html = "".join(f"""
     <div class="card group-card">
@@ -2235,7 +2307,7 @@ async def camera_view(request: Request, model: str):
     if not matched:
         body = """<div class="card"><p class="secondary">找不到這個裝置拍的照片。</p></div>"""
     else:
-        thumbs = "".join(lb_img_tag(it) for it in matched if it.get("thumbnail_url"))
+        thumbs = "".join(lb_img_tag(it) for it in matched if it.get("id"))
         body = f"""
         <div class="card" style="text-align:center;">
             <div class="stat-num">{len(matched)}</div>
@@ -2371,7 +2443,7 @@ async def location_view(request: Request, lat: float, lng: float):
     if not matched:
         body = """<div class="card"><p class="secondary">這個地點目前沒有照片(可能已被刪除或分類條件改變)。</p></div>"""
     else:
-        thumbs = "".join(lb_img_tag(it) for it in matched if it.get("thumbnail_url"))
+        thumbs = "".join(lb_img_tag(it) for it in matched if it.get("id"))
         body = f"""
         <div class="card" style="text-align:center;">
             <div class="stat-num">{len(matched)}</div>
@@ -2534,7 +2606,7 @@ def render_memories_html(items: list[dict]) -> str:
         
     def render_group(group: list[dict], label: str, title: str, field_id: str) -> str:
         ids = ",".join(it["id"] for it in group[:20])
-        thumbs = "".join(lb_img_tag(it) for it in group[:8] if it.get("thumbnail_url"))
+        thumbs = "".join(lb_img_tag(it) for it in group[:8] if it.get("id"))
         return f"""
         <div class="card group-card">
             <div class="group-title">{label}</div>
@@ -2707,7 +2779,7 @@ def render_gallery_html(items: list[dict], status: dict, visible_months: int, ye
 
     sections = "".join(f"""
     <div id="m-{mk}" class="section-title">{month_label(mk)}({len(group_items)} 張)</div>
-    <div class="photo-grid">{"".join(lb_img_tag(it) for it in group_items if it.get("thumbnail_url"))}</div>
+    <div class="photo-grid">{"".join(lb_img_tag(it) for it in group_items if it.get("id"))}</div>
     """ for mk, group_items in shown_groups)
 
     more_qs = f"&year={year_filter}" if year_filter else ""
@@ -2800,7 +2872,7 @@ def render_years_html(items: list[dict]) -> str:
 
     preview_sections = "".join(f"""
     <div class="section-title">{y if y == "未知年份" else y + " 年"}({len(grouped[y])} 張)</div>
-    <div class="photo-grid">{"".join(lb_img_tag(it) for it in grouped[y][:12] if it.get("thumbnail_url"))}</div>
+    <div class="photo-grid">{"".join(lb_img_tag(it) for it in grouped[y][:12] if it.get("id"))}</div>
     <a class="pill-link" href="/gallery?year={y}" style="margin-bottom:8px;">看這一年全部照片</a>
     """ for y in years)
 
@@ -2854,7 +2926,7 @@ def render_search_html(items: list[dict], q: str, year: str, month: str) -> str:
     else:
         result_html = f"""
         <div class="section-title">搜尋結果({len(results)} 張)</div>
-        <div class="photo-grid">{"".join(lb_img_tag(it) for it in results[:300] if it.get("thumbnail_url"))}</div>
+        <div class="photo-grid">{"".join(lb_img_tag(it) for it in results[:300] if it.get("id"))}</div>
         """
         if len(results) > 300:
             result_html += """<p class="secondary" style="text-align:center;">結果太多,只顯示前 300 張,建議加上更明確的關鍵字或年份/月份。</p>"""
@@ -2937,7 +3009,7 @@ async def tags_view(request: Request, tag: str):
     if not items:
         body = """<div class="card"><p class="secondary">這個標籤目前沒有照片。</p></div>"""
     else:
-        thumbs = "".join(lb_img_tag(it) for it in items if it.get("thumbnail_url"))
+        thumbs = "".join(lb_img_tag(it) for it in items if it.get("id"))
         body = f"""
         <div class="card" style="text-align:center;">
             <div class="stat-num">{len(items)}</div>
@@ -3020,7 +3092,7 @@ async def reviews_page(request: Request, period: str = "week"):
             <div class="stat-num">{len(matched)}</div>
             <div class="secondary">{label} 的照片</div>
         </div>
-        <div class="photo-grid">{"".join(lb_img_tag(it) for it in matched if it.get("thumbnail_url"))}</div>
+        <div class="photo-grid">{"".join(lb_img_tag(it) for it in matched if it.get("id"))}</div>
         <form method="post" action="/memories/render" class="inline-form">
             <input type="hidden" name="ids" value="{ids}" />
             <input type="hidden" name="title" value="{title}" />
