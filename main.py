@@ -219,15 +219,19 @@ form.inline-form { margin: 0; }
     transition: all 0.15s;
 }
 .filter-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-.select-mode .photo-tile { cursor: pointer; }
+.select-mode .photo-tile { cursor: pointer; -webkit-user-select: none; user-select: none; }
+.select-mode .photo-tile img { cursor: pointer; pointer-events: none; }
+/* 多選模式隱藏最愛/刪除按鈕，避免手機觸控被攔截 */
+.select-mode .tile-actions { display: none !important; }
 .select-mode .photo-tile.selected::after {
     content: ''; position: absolute; inset: 0; border: 3px solid var(--accent);
-    border-radius: 6px; background: rgba(10,132,255,0.15); pointer-events: none;
+    border-radius: 6px; background: rgba(10,132,255,0.15); pointer-events: none; z-index: 1;
 }
 .select-mode .photo-tile.selected::before {
-    content: '✓'; position: absolute; top: 6px; right: 6px; width: 22px; height: 22px;
-    background: var(--accent); color: #fff; border-radius: 50%; font-size: 13px;
+    content: '✓'; position: absolute; top: 6px; right: 6px; width: 26px; height: 26px;
+    background: var(--accent); color: #fff; border-radius: 50%; font-size: 14px;
     display: flex; align-items: center; justify-content: center; z-index: 2; font-weight: 700;
+    line-height: 26px; box-shadow: 0 1px 4px rgba(0,0,0,0.25);
 }
 .floating-action {
     position: fixed; bottom: calc(80px + var(--safe-bottom)); left: 50%; transform: translateX(-50%);
@@ -267,8 +271,26 @@ LIGHTBOX_ASSETS = """
 </div>
 <script>
 let lbThumbs = []; let lbIndex = 0;
-function initLightbox() { lbThumbs = Array.from(document.querySelectorAll('.lb-thumb')); lbThumbs.forEach((img, i) => { img.addEventListener('click', () => openLightbox(i)); }); }
-function openLightbox(i) { lbIndex = i; showLightbox(); document.getElementById('lightbox-overlay').classList.add('active'); }
+function initLightbox() {
+    lbThumbs = Array.from(document.querySelectorAll('.lb-thumb'));
+    lbThumbs.forEach((img, i) => {
+        img.addEventListener('click', (e) => {
+            // 多選模式下不開燈箱，讓選取邏輯處理
+            if (typeof selectMode !== 'undefined' && selectMode) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+            openLightbox(i);
+        });
+    });
+}
+function openLightbox(i) {
+    if (typeof selectMode !== 'undefined' && selectMode) return;
+    lbIndex = i;
+    showLightbox();
+    document.getElementById('lightbox-overlay').classList.add('active');
+}
 function showLightbox() {
     const t = lbThumbs[lbIndex];
     const isVideo = t.dataset.video === '1';
@@ -398,9 +420,12 @@ def page_shell(
     </div>
     {LIGHTBOX_ASSETS if include_lightbox else ""}
 <script>
-/* ========== 多選 + 批次刪除 ========== */
+/* ========== 多選 + 批次刪除（手機友善） ========== */
 let selectMode = false;
 let selectedIds = new Set();
+// 避免 touch 後又觸發 click 造成「選了又取消」
+let _selectTouchHandled = false;
+let _selectTouchTimer = null;
 
 function toggleSelectMode() {{
     selectMode = !selectMode;
@@ -412,6 +437,10 @@ function toggleSelectMode() {{
     if (enterBtn) enterBtn.style.display = selectMode ? 'none' : 'inline-block';
     document.querySelectorAll('.photo-tile.selected').forEach(el => el.classList.remove('selected'));
     updateSelectedCount();
+    // 進入多選時關掉燈箱，避免狀態混亂
+    if (selectMode) {{
+        try {{ closeLightbox(); }} catch (e) {{}}
+    }}
 }}
 
 function updateSelectedCount() {{
@@ -419,12 +448,8 @@ function updateSelectedCount() {{
     if (el) el.textContent = '已選 ' + selectedIds.size + ' 張';
 }}
 
-document.addEventListener('click', function(e) {{
-    if (!selectMode) return;
-    const tile = e.target.closest('.photo-tile');
+function toggleTileSelection(tile) {{
     if (!tile) return;
-    e.preventDefault();
-    e.stopPropagation();
     const id = tile.dataset.id;
     if (!id) return;
     if (selectedIds.has(id)) {{
@@ -435,6 +460,65 @@ document.addEventListener('click', function(e) {{
         tile.classList.add('selected');
     }}
     updateSelectedCount();
+}}
+
+function handleSelectOnTile(e) {{
+    if (!selectMode) return;
+    // 工具列 / 按鈕本身不處理
+    if (e.target.closest('#select-toolbar') || e.target.closest('#enter-select-btn') || e.target.closest('button') || e.target.closest('a') || e.target.closest('form')) return;
+    const tile = e.target.closest('.photo-tile');
+    if (!tile) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    toggleTileSelection(tile);
+}}
+
+// 記錄 touchstart，用來區分「點一下」與「滑動捲頁」
+let _touchStartX = 0, _touchStartY = 0, _touchStartTile = null;
+document.addEventListener('touchstart', function(e) {{
+    if (!selectMode) return;
+    const t = e.touches && e.touches[0];
+    if (!t) return;
+    _touchStartX = t.clientX;
+    _touchStartY = t.clientY;
+    _touchStartTile = (e.target.closest && e.target.closest('.photo-tile')) || null;
+}}, {{ capture: true, passive: true }});
+
+// 手機：優先用 touchend（比 click 更即時、較少被 lightbox 搶走）
+document.addEventListener('touchend', function(e) {{
+    if (!selectMode) return;
+    const tile = e.target.closest && e.target.closest('.photo-tile');
+    if (!tile || tile !== _touchStartTile) {{
+        _touchStartTile = null;
+        return;
+    }}
+    const t = (e.changedTouches && e.changedTouches[0]) || null;
+    if (t) {{
+        const dx = Math.abs(t.clientX - _touchStartX);
+        const dy = Math.abs(t.clientY - _touchStartY);
+        // 移動超過約 12px 視為捲動，不選取
+        if (dx > 12 || dy > 12) {{
+            _touchStartTile = null;
+            return;
+        }}
+    }}
+    _touchStartTile = null;
+    _selectTouchHandled = true;
+    if (_selectTouchTimer) clearTimeout(_selectTouchTimer);
+    _selectTouchTimer = setTimeout(function() {{ _selectTouchHandled = false; }}, 450);
+    handleSelectOnTile(e);
+}}, {{ capture: true, passive: false }});
+
+// 桌面 / 部分瀏覽器 fallback：click（若剛處理過 touch 則略過，避免雙重切換）
+document.addEventListener('click', function(e) {{
+    if (!selectMode) return;
+    if (_selectTouchHandled) {{
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+    }}
+    handleSelectOnTile(e);
 }}, true);
 
 async function batchDeleteSelected() {{
@@ -458,6 +542,9 @@ async function batchDeleteSelected() {{
         if (data.success) {{
             (data.deleted_ids || []).forEach(id => {{
                 document.querySelectorAll('.photo-tile[data-id="' + id + '"]').forEach(el => el.remove());
+                if (typeof removePhotoEverywhere === 'function') {{
+                    try {{ removePhotoEverywhere(id); }} catch (ex) {{}}
+                }}
             }});
             alert('成功刪除 ' + data.deleted + ' 張' + (data.failed > 0 ? '，失敗 ' + data.failed + ' 張' : ''));
             toggleSelectMode();
