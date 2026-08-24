@@ -479,9 +479,15 @@ async function batchDeleteSelected() {{
 
 def lb_img_tag(item: dict, badge: str | None = None) -> str:
     item_id = (item.get("id") or "").replace('"', "&quot;")
-    # 一律走後端代理，避免 Graph 暫時縮圖網址過期導致全黑
-    thumb = f"/api/media/{item_id}/thumb" if item_id else ""
-    full = f"/api/media/{item_id}/thumb?size=large" if item_id else ""
+    stored = item.get("thumbnail_url") or item.get("thumbnailUrl") or ""
+    stored_large = item.get("thumbnail_large_url") or item.get("thumbnailLargeUrl") or stored
+    # 有快取網址就先用（較快）；沒有才走代理，避免 6000 張同時打 Graph
+    if stored and stored.startswith("http"):
+        thumb = stored
+        full = stored_large if stored_large.startswith("http") else stored
+    else:
+        thumb = f"/api/media/{item_id}/thumb" if item_id else ""
+        full = f"/api/media/{item_id}/thumb?size=large" if item_id else ""
     name = (item.get("name") or "").replace('"', "&quot;")
     taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
     is_fav = bool(item.get("favorite"))
@@ -489,9 +495,11 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
     is_video = mime.startswith("video/") or name.lower().endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm"))
     badge_html = f'<div class="photo-badge">{badge}</div>' if badge else ""
     video_badge = '<div class="video-badge">▶</div>' if is_video else ""
+    # 加上 onerror 自動改走代理
+    onerr = f"this.onerror=null;this.src='/api/media/{item_id}/thumb';" if item_id else ""
     return f"""
     <div class="photo-tile" data-id="{item_id}">
-        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" data-id="{item_id}" data-fav="{"1" if is_fav else "0"}" data-video="{"1" if is_video else "0"}" loading="lazy" />
+        <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" data-id="{item_id}" data-fav="{"1" if is_fav else "0"}" data-video="{"1" if is_video else "0"}" loading="lazy" onerror="{onerr}" />
         {badge_html}
         {video_badge}
         <div class="tile-actions">
@@ -3028,7 +3036,7 @@ async def orientation_page(request: Request, orient: str = "portrait"):
     if not sid:
         return RedirectResponse("/login", status_code=303)
     items = db_get_photos(sid)
-    filtered = [it for it in items if orientation_of(it) == orient and it.get("thumbnail_url")]
+    filtered = [it for it in items if orientation_of(it) == orient and it.get("id")]
     chips = "".join(
         f'<a class="filter-chip{" active" if orient == o else ""}" href="/orientation?orient={o}">{label}</a>'
         for o, label in [("portrait", "直式 📱"), ("landscape", "橫式 🖼"), ("square", "正方形 ⬜")]
