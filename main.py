@@ -397,6 +397,82 @@ def page_shell(
         {tabbar_html}
     </div>
     {LIGHTBOX_ASSETS if include_lightbox else ""}
+<script>
+/* ========== 多選 + 批次刪除 ========== */
+let selectMode = false;
+let selectedIds = new Set();
+
+function toggleSelectMode() {{
+    selectMode = !selectMode;
+    selectedIds.clear();
+    document.body.classList.toggle('select-mode', selectMode);
+    const toolbar = document.getElementById('select-toolbar');
+    const enterBtn = document.getElementById('enter-select-btn');
+    if (toolbar) toolbar.style.display = selectMode ? 'flex' : 'none';
+    if (enterBtn) enterBtn.style.display = selectMode ? 'none' : 'inline-block';
+    document.querySelectorAll('.photo-tile.selected').forEach(el => el.classList.remove('selected'));
+    updateSelectedCount();
+}}
+
+function updateSelectedCount() {{
+    const el = document.getElementById('selected-count');
+    if (el) el.textContent = '已選 ' + selectedIds.size + ' 張';
+}}
+
+document.addEventListener('click', function(e) {{
+    if (!selectMode) return;
+    const tile = e.target.closest('.photo-tile');
+    if (!tile) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const id = tile.dataset.id;
+    if (!id) return;
+    if (selectedIds.has(id)) {{
+        selectedIds.delete(id);
+        tile.classList.remove('selected');
+    }} else {{
+        selectedIds.add(id);
+        tile.classList.add('selected');
+    }}
+    updateSelectedCount();
+}}, true);
+
+async function batchDeleteSelected() {{
+    if (selectedIds.size === 0) {{
+        alert('請先選擇要刪除的照片');
+        return;
+    }}
+    if (!confirm('確定要刪除這 ' + selectedIds.size + ' 張照片嗎？\n\n照片會移到 OneDrive 回收桶，之後還可以還原。')) {{
+        return;
+    }}
+    const ids = Array.from(selectedIds).join(',');
+    const btn = document.querySelector('#select-toolbar .btn-primary');
+    if (btn) {{ btn.disabled = true; btn.textContent = '刪除中...'; }}
+    try {{
+        const resp = await fetch('/api/photos/batch-delete', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+            body: 'ids=' + encodeURIComponent(ids)
+        }});
+        const data = await resp.json();
+        if (data.success) {{
+            (data.deleted_ids || []).forEach(id => {{
+                document.querySelectorAll('.photo-tile[data-id="' + id + '"]').forEach(el => el.remove());
+            }});
+            alert('成功刪除 ' + data.deleted + ' 張' + (data.failed > 0 ? '，失敗 ' + data.failed + ' 張' : ''));
+            toggleSelectMode();
+        }} else {{
+            alert('刪除失敗：' + (data.error || '未知錯誤'));
+        }}
+    }} catch (err) {{
+        console.error(err);
+        alert('網路錯誤，請稍後再試');
+    }} finally {{
+        if (btn) {{ btn.disabled = false; btn.textContent = '刪除所選'; }}
+    }}
+}}
+</script>
+
 </body>
 </html>
 """
@@ -1838,6 +1914,55 @@ async def api_toggle_favorite(request: Request, id: str = Form(...)):
     conn.close()
     return JSONResponse({"success": True, "favorite": bool(new_val)})
 
+
+@app.post("/api/photos/batch-delete")
+async def api_batch_delete(request: Request, ids: str = Form(...)):
+    """批次刪除照片（移到 OneDrive 回收桶）"""
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+
+    id_list = [i.strip() for i in ids.split(",") if i.strip()]
+    if not id_list:
+        return JSONResponse({"success": False, "error": "no_ids"})
+    if len(id_list) > 50:
+        return JSONResponse({"success": False, "error": "一次最多刪除 50 張，請分批操作"})
+
+    headers = {"Authorization": f"Bearer {token}"}
+    success_ids = []
+    failed = []
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for pid in id_list:
+            try:
+                resp = await client.delete(
+                    f"{GRAPH_BASE}/me/drive/items/{pid}",
+                    headers=headers,
+                )
+                if resp.status_code in (204, 200):
+                    success_ids.append(pid)
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        conn.execute("DELETE FROM photos WHERE id = ? AND sid = ?", (pid, sid))
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
+                else:
+                    failed.append(pid)
+            except Exception:
+                failed.append(pid)
+            await asyncio.sleep(0.12)
+
+    return JSONResponse({
+        "success": True,
+        "deleted": len(success_ids),
+        "failed": len(failed),
+        "deleted_ids": success_ids,
+    })
+
+
 @app.get("/favorites", response_class=HTMLResponse)
 async def favorites_page(request: Request):
     sid = request.session.get("sid")
@@ -2611,12 +2736,26 @@ def render_gallery_html(items: list[dict], status: dict, visible_months: int, ye
     </div>
     """
 
+    select_controls = """
+    <div id="select-toolbar" style="display:none; margin-bottom:14px; gap:8px; align-items:center;">
+        <button class="btn-secondary" onclick="toggleSelectMode()" style="flex:none; width:auto; padding:10px 16px;">取消</button>
+        <span id="selected-count" class="secondary" style="flex:1; text-align:center;">已選 0 張</span>
+        <button class="btn-primary" onclick="batchDeleteSelected()" style="flex:none; width:auto; padding:10px 18px; background:var(--danger); box-shadow:none;">刪除所選</button>
+    </div>
+    <div style="margin-bottom:14px;">
+        <button class="btn-secondary" id="enter-select-btn" onclick="toggleSelectMode()" style="width:auto; display:inline-block; padding:10px 18px;">
+            ☑️ 多選刪除
+        </button>
+    </div>
+    """
+
     title = f"{year_filter} 的照片({len(items)})" if year_filter else f"我的圖庫({len(all_items)})"
     body = f"""
     {banners}
     {filter_banner}
     {search_bar}
     {quick_links}
+    {select_controls}
     <a class="btn-secondary" href="/scan/start" style="margin-bottom:14px;">重新掃描 OneDrive</a>
     {jump_nav}
     {sections}
