@@ -877,7 +877,7 @@ async def login(request: Request):
     state = str(uuid.uuid4()); sid = request.session.get("sid") or str(uuid.uuid4())
     request.session["state"] = state; request.session["sid"] = sid
     TOKEN_STORE.setdefault(sid, {})
-    auth_url = _msal_app().get_authorization_request_url(scopes=SCOPES, state=state, redirect_uri=REDIRECT_URI)
+    auth_url = _msal_app().get_authorization_request_url(scopes=SCOPES, state=state, redirect_uri=REDIRECT_URI, prompt="select_account")
     return RedirectResponse(auth_url)
 
 @app.get("/callback")
@@ -916,10 +916,22 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
 @app.get("/logout")
 async def logout(request: Request):
+    """完整登出：清後端 token/session，並導向 Microsoft 登出頁以解除 SSO 自動登入。"""
     sid = request.session.get("sid")
-    if sid: TOKEN_STORE.pop(sid, None)
+    if sid:
+        TOKEN_STORE.pop(sid, None)
     request.session.clear()
-    return RedirectResponse("/")
+    # 導向 Microsoft 登出，避免瀏覽器 SSO 自動用同一帳號再登入
+    post = quote(REDIRECT_URI.replace("/callback", "/") if "/callback" in REDIRECT_URI else "https://onedrive-album-app.onrender.com/", safe="")
+    # 使用目前站台首頁當 post_logout_redirect
+    # 若在 Render，使用者可在環境變數設 PUBLIC_BASE_URL
+    base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("REDIRECT_URI", "http://localhost:8000").replace("/callback", "")
+    post_logout = quote(base.rstrip("/") + "/", safe="")
+    logout_url = (
+        f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/logout"
+        f"?post_logout_redirect_uri={post_logout}"
+    )
+    return RedirectResponse(logout_url)
 
 @app.get("/restore")
 async def restore_page(request: Request):
