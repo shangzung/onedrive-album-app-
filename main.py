@@ -533,7 +533,7 @@ async function batchDeleteSelected() {{
         alert('請先選擇要刪除的照片');
         return;
     }}
-    if (!confirm('確定要刪除這 ' + window.selectedIds.size + ' 張照片嗎？\n\n照片會移到 OneDrive 回收桶，之後還可以還原。')) {{
+    if (!confirm('確定要刪除這 ' + window.selectedIds.size + ' 張照片嗎？\\n\\n照片會移到 OneDrive 回收桶，之後還可以還原。')) {{
         return;
     }}
     const ids = Array.from(window.selectedIds).join(',');
