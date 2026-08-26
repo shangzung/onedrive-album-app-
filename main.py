@@ -589,8 +589,17 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
     is_video = mime.startswith("video/") or name.lower().endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm"))
     badge_html = f'<div class="photo-badge">{badge}</div>' if badge else ""
     video_badge = '<div class="video-badge">▶</div>' if is_video else ""
-    # 加上 onerror：快取 URL 失效 → 走代理
-    onerr = f"this.onerror=null;this.src='/api/media/{item_id}/thumb';" if item_id else ""
+    # 快取 URL 失效 → 代理；代理也 404 時隱藏該格（後端會一併清 DB）
+    if item_id:
+        onerr = (
+            f"if(this.dataset.proxyTried){{"
+            f"var t=this.closest('.photo-tile');if(t)t.remove();"
+            f"}}else{{"
+            f"this.dataset.proxyTried=1;this.src='/api/media/{item_id}/thumb';"
+            f"}}"
+        )
+    else:
+        onerr = ""
     return f"""
     <div class="photo-tile" data-id="{item_id}">
         <img class="lb-thumb" src="{thumb}" data-full="{full}" data-name="{name}" data-taken="{taken}" data-id="{item_id}" data-fav="{"1" if is_fav else "0"}" data-video="{"1" if is_video else "0"}" loading="lazy" onerror="{onerr}" />
@@ -956,6 +965,7 @@ async def more_page(request: Request):
         <a class="list-row tappable" href="/reviews"><span class="row-icon">📅</span><span class="row-label">上週 / 上個月回顧</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/duplicates/view"><span class="row-icon">🧬</span><span class="row-label">疑似重複照片</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/cleanup"><span class="row-icon">🧹</span><span class="row-label">快速清理(含模糊偵測)</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/cleanup/missing"><span class="row-icon">👻</span><span class="row-label">清除失效照片(灰格/404)</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/share/event"><span class="row-icon">🔗</span><span class="row-label">相簿分享連結</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/scan/start"><span class="row-icon">🔄</span><span class="row-label">增量掃描 OneDrive</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/scan/start?force=1"><span class="row-icon">♻️</span><span class="row-label">強制全量重新掃描</span><span class="chevron">›</span></a>
@@ -1967,7 +1977,16 @@ async def api_media_thumb(request: Request, item_id: str, size: str = "medium"):
                 headers=headers,
             )
             if resp.status_code == 404:
-                return JSONResponse({"error": "not_found"}, status_code=404)
+                # OneDrive 已無此檔 → 清掉本地快取，避免圖庫一直出現灰格 + 404
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, item_id))
+                    conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ?", (sid, item_id))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                return JSONResponse({"error": "not_found", "purged": True}, status_code=404)
             if resp.status_code != 200:
                 # fallback: 直接取 content（較慢但可用）
                 content_resp = await client.get(
@@ -1985,6 +2004,20 @@ async def api_media_thumb(request: Request, item_id: str, size: str = "medium"):
             data = resp.json()
             thumbs = data.get("value") or []
             if not thumbs:
+                # 有項目但無縮圖：再確認檔案是否還在
+                meta = await client.get(
+                    f"{GRAPH_BASE}/me/drive/items/{item_id}?$select=id",
+                    headers=headers,
+                )
+                if meta.status_code == 404:
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, item_id))
+                        conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ?", (sid, item_id))
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
                 return JSONResponse({"error": "no_thumbnails"}, status_code=404)
 
             t = thumbs[0]
@@ -2149,6 +2182,108 @@ async def api_batch_delete(request: Request, ids: str = Form(...)):
         "failed": len(failed),
         "deleted_ids": success_ids,
     })
+
+
+
+@app.post("/api/photos/purge-missing")
+async def api_purge_missing(request: Request, limit: int = 200):
+    """
+    檢查本地資料庫中的照片是否仍存在於 OneDrive；
+    不存在的會從 SQLite 移除（不會動到 OneDrive）。
+    用來清掉灰格 / 404 縮圖。
+    """
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+
+    items = db_get_photos(sid)
+    # 優先檢查沒有有效縮圖網址的（較可能已失效）
+    candidates = []
+    for it in items:
+        thumb = it.get("thumbnail_url") or it.get("thumbnailUrl") or ""
+        if not thumb or not str(thumb).startswith("http"):
+            candidates.append(it)
+    # 再補一些有網址的做抽樣檢查
+    others = [it for it in items if it not in candidates]
+    candidates = (candidates + others)[: max(1, min(limit, 500))]
+
+    purged = []
+    checked = 0
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        for it in candidates:
+            pid = it.get("id")
+            if not pid:
+                continue
+            checked += 1
+            try:
+                resp = await client.get(
+                    f"{GRAPH_BASE}/me/drive/items/{pid}?$select=id",
+                    headers=headers,
+                )
+                if resp.status_code == 404:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, pid))
+                    conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ?", (sid, pid))
+                    conn.commit()
+                    conn.close()
+                    purged.append(pid)
+                elif resp.status_code == 429:
+                    await asyncio.sleep(int(resp.headers.get("Retry-After", 3)))
+            except Exception:
+                continue
+            await asyncio.sleep(0.08)
+
+    return JSONResponse({
+        "success": True,
+        "checked": checked,
+        "purged": len(purged),
+        "purged_ids": purged[:50],
+    })
+
+
+@app.get("/cleanup/missing", response_class=HTMLResponse)
+async def cleanup_missing_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
+    body = """
+    <div class="card banner-info">
+        <p class="secondary" style="margin:0;">
+            若圖庫出現<strong>灰色空格</strong>，且 Console 出現 <code>/api/media/.../thumb 404</code>，
+            代表這些照片已從 OneDrive 刪除，但本地資料庫還留著紀錄。
+        </p>
+    </div>
+    <div class="card">
+        <p class="secondary">點下方按鈕會向 OneDrive 確認檔案是否還在；不存在的只會從本機資料庫移除，不會再刪雲端檔案。</p>
+        <button class="btn-primary" id="purge-btn" onclick="purgeMissing()">清除失效照片</button>
+        <p id="purge-result" class="secondary" style="margin-top:12px;"></p>
+    </div>
+    <script>
+    async function purgeMissing() {
+        const btn = document.getElementById('purge-btn');
+        const el = document.getElementById('purge-result');
+        btn.disabled = true;
+        btn.textContent = '檢查中……';
+        el.textContent = '';
+        try {
+            const resp = await fetch('/api/photos/purge-missing', { method: 'POST' });
+            const data = await resp.json();
+            if (data.success) {
+                el.textContent = '已檢查 ' + data.checked + ' 筆，清除 ' + data.purged + ' 筆失效紀錄。請回圖庫重新整理。';
+            } else {
+                el.textContent = '失敗：' + (data.error || '未知錯誤');
+            }
+        } catch (e) {
+            el.textContent = '網路錯誤，請稍後再試';
+        }
+        btn.disabled = false;
+        btn.textContent = '清除失效照片';
+    }
+    </script>
+    """
+    return HTMLResponse(page_shell("清除失效照片", body, active_tab="more", back_href="/more"))
 
 
 @app.get("/favorites", response_class=HTMLResponse)
