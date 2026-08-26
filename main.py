@@ -42,6 +42,14 @@ TENANT_ID = os.environ.get("TENANT_ID", "common")
 REDIRECT_URI = os.environ.get("REDIRECT_URI", "http://localhost:8000/callback")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 
+# 可選：AI 智慧分類（OpenAI 相容 API 或 Gemini）
+# 不設定也能用「規則智慧分類」（時間/檔名/模糊/方向等，完全免費）
+AI_API_KEY = os.environ.get("AI_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
+AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
+# 若使用 Gemini 原生 API，設 AI_PROVIDER=gemini
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "openai").lower()  # openai | gemini
+
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["Files.ReadWrite.All", "User.Read"]
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -620,6 +628,7 @@ TOKEN_STORE: dict[str, dict] = {}
 SCAN_STATUS: dict[str, dict] = {}
 SCAN_TASKS: dict[str, asyncio.Task] = {}
 MEMORY_JOBS: dict[str, dict] = {}
+CLASSIFY_JOBS: dict[str, dict] = {}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -957,6 +966,7 @@ async def more_page(request: Request):
         <a class="list-row tappable" href="/locations"><span class="row-icon">📍</span><span class="row-label">拍攝地點(含地圖)</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/search"><span class="row-icon">🔍</span><span class="row-label">圖庫搜尋</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/favorites"><span class="row-icon">⭐</span><span class="row-label">我的最愛</span><span class="chevron">›</span></a>
+        <a class="list-row tappable" href="/smart-classify"><span class="row-icon">✨</span><span class="row-label">智慧分類（規則/AI）</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/tags"><span class="row-icon">🏷</span><span class="row-label">自訂標籤</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/orientation"><span class="row-icon">📐</span><span class="row-label">方向篩選(直/橫式)</span><span class="chevron">›</span></a>
         <a class="list-row tappable" href="/cameras"><span class="row-icon">📷</span><span class="row-label">依相機/裝置分類</span><span class="chevron">›</span></a>
@@ -2482,7 +2492,8 @@ async def render_albums_html(items: list[dict]) -> str:
     video_empty = "" if videos else """<p class="secondary">目前沒有影片。</p>"""
 
     body = f"""
-    <p class="secondary" style="margin:0 6px 14px;">全部用現有的拍攝時間 / GPS / 檔名 / 裝置資料分類,地點名稱來自免費的 OpenStreetMap,沒有呼叫任何付費 AI 服務。</p>
+    <p class="secondary" style="margin:0 6px 14px;">用拍攝時間 / GPS / 檔名 / 裝置資料分類；地名來自免費 OpenStreetMap。</p>
+    <a class="btn-primary" href="/smart-classify" style="margin-bottom:14px;">✨ 智慧分類（規則 / 可選 AI）</a>
     <div class="section-title">螢幕截圖({len(screenshots)} 張)</div>
     <div class="card">
         <div class="photo-grid">{thumb_row(screenshots, limit=24) or ""}</div>
@@ -2509,6 +2520,323 @@ async def albums(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login", status_code=303)
     return HTMLResponse(await render_albums_html(db_get_photos(sid)))
+
+
+# ---------------------------------------------------------------------------
+# 智慧分類（規則引擎 + 可選 AI 視覺模型）
+# ---------------------------------------------------------------------------
+SMART_CATEGORIES = [
+    "人像", "食物", "寵物", "風景", "建築", "文件", "截圖",
+    "夜景", "車輛", "運動", "植物", "家庭", "旅行", "其他",
+]
+
+# 規則引擎用的檔名關鍵字（免 API）
+_RULE_NAME_KW = {
+    "人像": ["selfie", "portrait", "自拍", "人像", "face"],
+    "食物": ["food", "meal", "restaurant", "美食", "晚餐", "午餐", "早餐", "火鍋", "咖啡"],
+    "寵物": ["dog", "cat", "pet", "狗", "貓", "寵物", "汪", "喵"],
+    "風景": ["landscape", "sunset", "sunrise", "beach", "mountain", "風景", "夕陽", "海"],
+    "建築": ["building", "architecture", "塔", "橋", "temple", "church"],
+    "文件": ["doc", "scan", "receipt", "invoice", "證件", "收據", "掃描"],
+    "截圖": ["screenshot", "screen shot", "螢幕截圖", "截圖"],
+    "夜景": ["night", "夜景", "nightscape"],
+    "車輛": ["car", "bike", "motor", "車", "停車"],
+    "運動": ["sport", "run", "gym", "球", "運動", "健身"],
+    "植物": ["flower", "plant", "garden", "花", "植物", "樹"],
+    "家庭": ["family", "家庭", "家人", "聚餐", "過年"],
+    "旅行": ["travel", "trip", "tour", "旅行", "旅遊", "出國", "vacation"],
+}
+
+
+def rule_based_tags(item: dict) -> list[str]:
+    """完全本地、免 API 的智慧標籤。"""
+    tags: list[str] = []
+    name = (item.get("name") or "").lower()
+    mime = (item.get("mime_type") or item.get("mimeType") or "").lower()
+
+    if is_screenshot(item) or "screenshot" in name or "螢幕快照" in name:
+        tags.append("截圖")
+
+    if mime.startswith("video/") or name.endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm")):
+        tags.append("影片")
+
+    # 檔名關鍵字
+    for cat, kws in _RULE_NAME_KW.items():
+        if any(kw in name for kw in kws):
+            if cat not in tags:
+                tags.append(cat)
+
+    # 時間帶
+    dt = parse_taken(item)
+    if dt:
+        h = dt.hour
+        if 5 <= h < 8:
+            tags.append("清晨")
+        elif 17 <= h < 19:
+            tags.append("黃昏")
+        elif h >= 19 or h < 5:
+            if "夜景" not in tags:
+                tags.append("夜景")
+
+    # 模糊
+    if is_blurry(item):
+        tags.append("模糊")
+
+    # 方向
+    orient = orientation_of(item)
+    if orient == "portrait":
+        tags.append("直式")
+    elif orient == "landscape":
+        tags.append("橫式")
+
+    # 有無 GPS
+    if item.get("latitude") is not None and item.get("longitude") is not None:
+        tags.append("有定位")
+    else:
+        tags.append("無定位")
+
+    # 最愛
+    if item.get("favorite"):
+        tags.append("最愛")
+
+    return tags
+
+
+async def ai_classify_image(image_bytes: bytes, filename: str = "") -> list[str]:
+    """呼叫可選的視覺模型，回傳中文類別列表。失敗回傳 []。"""
+    if not AI_API_KEY:
+        return []
+    import base64
+    b64 = base64.b64encode(image_bytes[: 2 * 1024 * 1024]).decode("ascii")
+    cats = "、".join(SMART_CATEGORIES)
+    prompt = (
+        f"你是相簿分類助手。根據這張照片（檔名：{filename}），"
+        f"從下列類別中選出 1～3 個最合適的，只回傳類別名稱，用逗號分隔，不要其他文字：\n{cats}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            if AI_PROVIDER == "gemini":
+                # Google Generative Language API
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent?key={AI_API_KEY}"
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"text": prompt},
+                            {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                        ]
+                    }],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 64},
+                }
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    print(f"gemini classify fail: {resp.status_code} {resp.text[:200]}")
+                    return []
+                data = resp.json()
+                text = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+            else:
+                # OpenAI-compatible chat completions with vision
+                url = f"{AI_BASE_URL}/chat/completions"
+                headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
+                payload = {
+                    "model": AI_MODEL,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        ],
+                    }],
+                    "max_tokens": 64,
+                    "temperature": 0.2,
+                }
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    print(f"openai classify fail: {resp.status_code} {resp.text[:200]}")
+                    return []
+                data = resp.json()
+                text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        raw = (text or "").replace("，", ",").replace("、", ",").replace(" ", "")
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        valid = set(SMART_CATEGORIES)
+        return [p for p in parts if p in valid][:3]
+    except Exception as e:
+        print(f"ai_classify_image error: {e}")
+        return []
+
+
+async def run_smart_classify(sid: str, token: str | None, use_ai: bool = False, limit: int = 300):
+    """背景任務：規則標籤全量；AI 僅對尚未有「AI:」前綴標籤的照片抽樣。"""
+    job = CLASSIFY_JOBS.setdefault(sid, {})
+    job.update({"status": "running", "progress": 0, "total": 0, "tagged": 0, "ai_tagged": 0, "error": None})
+    try:
+        items = [it for it in db_get_photos(sid) if it.get("id") and not is_screenshot(it)]
+        # 影片也可規則標，但跳過 AI
+        job["total"] = len(items)
+        # 1) 規則引擎（全部）
+        for idx, it in enumerate(items):
+            rules = rule_based_tags(it)
+            for t in rules:
+                add_photo_tag(sid, it["id"], t)
+            job["progress"] = idx + 1
+            job["tagged"] = idx + 1
+            if idx % 50 == 0:
+                await asyncio.sleep(0)  # yield
+
+        # 2) 可選 AI
+        ai_count = 0
+        if use_ai and AI_API_KEY and token:
+            # 優先沒有主題標籤的照片
+            candidates = []
+            for it in items:
+                existing = set(get_photo_tags(sid, it["id"]))
+                if existing & set(SMART_CATEGORIES) - {"截圖", "其他"}:
+                    continue
+                candidates.append(it)
+            random.shuffle(candidates)
+            candidates = candidates[: max(1, min(limit, 200))]
+            job["ai_total"] = len(candidates)
+            async with httpx.AsyncClient(timeout=60) as client:
+                for idx, it in enumerate(candidates):
+                    job["ai_progress"] = idx + 1
+                    # 用縮圖做分類（較省流量）
+                    raw = None
+                    thumb = it.get("thumbnail_url") or it.get("thumbnailUrl")
+                    if thumb:
+                        try:
+                            r = await client.get(thumb, timeout=20, follow_redirects=True)
+                            if r.status_code == 200:
+                                raw = r.content
+                        except Exception:
+                            pass
+                    if not raw and token:
+                        raw = await get_full_image_bytes(client, it, token)
+                    if not raw:
+                        continue
+                    # 壓小一點
+                    try:
+                        img = Image.open(io.BytesIO(raw)).convert("RGB")
+                        img.thumbnail((768, 768), Image.LANCZOS)
+                        buf = io.BytesIO()
+                        img.save(buf, "JPEG", quality=85)
+                        raw = buf.getvalue()
+                    except Exception:
+                        pass
+                    labels = await ai_classify_image(raw, it.get("name") or "")
+                    for lab in labels:
+                        add_photo_tag(sid, it["id"], lab)
+                        add_photo_tag(sid, it["id"], f"AI:{lab}")
+                    if labels:
+                        ai_count += 1
+                        job["ai_tagged"] = ai_count
+                    await asyncio.sleep(0.35)  # 溫和限速
+
+        job["status"] = "done"
+        job["ai_tagged"] = ai_count
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+        print(f"smart classify error: {e}")
+
+
+@app.get("/smart-classify", response_class=HTMLResponse)
+async def smart_classify_page(request: Request):
+    sid = request.session.get("sid")
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
+    job = CLASSIFY_JOBS.get(sid) or {}
+    status = job.get("status", "idle")
+    ai_ready = bool(AI_API_KEY)
+
+    # 統計現有智慧標籤
+    all_tags = get_all_tags(sid)
+    smart_set = set(SMART_CATEGORIES) | {"清晨", "黃昏", "模糊", "直式", "橫式", "有定位", "無定位", "最愛", "影片"}
+    smart_tags = [(t, c) for t, c in all_tags if t in smart_set or t.startswith("AI:")]
+
+    banner = ""
+    refresh = None
+    if status == "running":
+        prog = job.get("progress", 0)
+        total = job.get("total", 0)
+        ai_p = job.get("ai_progress", 0)
+        ai_t = job.get("ai_total", 0)
+        extra = f"；AI {ai_p}/{ai_t}" if ai_t else ""
+        banner = f"""<div class="card banner-info"><b>智慧分類進行中</b><p class="secondary" style="margin:6px 0 0;">規則標籤 {prog}/{total}{extra}</p></div>"""
+        refresh = 3
+    elif status == "done":
+        banner = f"""<div class="card banner-success"><b>分類完成</b><p class="secondary" style="margin:6px 0 0;">規則處理 {job.get('tagged', 0)} 張；AI 標註 {job.get('ai_tagged', 0)} 張</p></div>"""
+    elif status == "error":
+        banner = f"""<div class="card banner-error"><b>分類失敗</b><p class="secondary" style="margin:6px 0 0;">{job.get('error')}</p></div>"""
+
+    if smart_tags:
+        rows = "".join(
+            f"""<a class="list-row tappable" href="/tags/view?tag={quote(t)}">
+                <span class="row-icon">🏷</span>
+                <span class="row-label">{t}</span>
+                <span class="row-value">{c} 張</span>
+                <span class="chevron">›</span>
+            </a>"""
+            for t, c in smart_tags[:40]
+        )
+        tags_html = f'<div class="list-group">{rows}</div>'
+    else:
+        tags_html = """<div class="card"><p class="secondary">還沒有智慧標籤。按下方按鈕開始分類。</p></div>"""
+
+    ai_hint = (
+        f"""<p class="secondary" style="margin:0 6px 14px;">已偵測到 AI 金鑰（{AI_PROVIDER} / {AI_MODEL}），可啟用視覺模型加強分類。</p>"""
+        if ai_ready else
+        """<p class="secondary" style="margin:0 6px 14px;">
+        目前為<strong>規則智慧分類</strong>（免費、不上傳照片）：依時間、檔名、模糊、方向、定位等自動打標。<br>
+        若要啟用 AI 視覺分類，在環境變數設定 <code>AI_API_KEY</code>（或 OPENAI_API_KEY / GEMINI_API_KEY），
+        可選 <code>AI_PROVIDER=openai|gemini</code>、<code>AI_MODEL</code>、<code>AI_BASE_URL</code>。
+        </p>"""
+    )
+
+    ai_btn = ""
+    if ai_ready and status != "running":
+        ai_btn = """<form method="post" action="/smart-classify/start" class="inline-form">
+            <input type="hidden" name="use_ai" value="1" />
+            <button class="btn-secondary" type="submit">🤖 規則 + AI 視覺分類（較慢、耗額度）</button>
+        </form>"""
+
+    body = f"""
+    {banner}
+    {ai_hint}
+    <div class="section-title">開始分類</div>
+    <form method="post" action="/smart-classify/start" class="inline-form">
+        <input type="hidden" name="use_ai" value="0" />
+        <button class="btn-primary" type="submit" {"disabled" if status == "running" else ""}>
+            {"分類中…" if status == "running" else "✨ 執行規則智慧分類（免費）"}
+        </button>
+    </form>
+    {ai_btn}
+    <div class="section-title">已產生的智慧標籤</div>
+    {tags_html}
+    <a class="btn-secondary" href="/tags" style="margin-top:12px;">查看全部標籤</a>
+    """
+    return HTMLResponse(page_shell("智慧分類", body, active_tab="albums", back_href="/albums", meta_refresh=refresh))
+
+
+@app.post("/smart-classify/start")
+async def smart_classify_start(request: Request, use_ai: str = Form("0")):
+    sid = request.session.get("sid")
+    token = await get_ms_token(sid)
+    if not sid or not token:
+        return RedirectResponse("/login", status_code=303)
+    job = CLASSIFY_JOBS.get(sid) or {}
+    if job.get("status") == "running":
+        return RedirectResponse("/smart-classify", status_code=303)
+    want_ai = use_ai in ("1", "true", "yes")
+    CLASSIFY_JOBS[sid] = {"status": "running", "progress": 0, "total": 0}
+    asyncio.create_task(run_smart_classify(sid, token, use_ai=want_ai and bool(AI_API_KEY), limit=150))
+    return RedirectResponse("/smart-classify", status_code=303)
+
+
 
 # ---------------------------------------------------------------------------
 # 依相機/裝置分類
@@ -2838,7 +3166,22 @@ def collect_theme_photos(sid: str, items: list[dict], theme_key: str) -> list[di
 
 
 def prepare_frame(image_bytes: bytes, size: tuple[int, int]) -> Image.Image:
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    """把任意可解碼的圖壓成固定尺寸畫布。HEIC 若系統無編解碼會拋錯，由呼叫端改走 JPEG 縮圖。"""
+    bio = io.BytesIO(image_bytes)
+    try:
+        img = Image.open(bio)
+        img.load()
+    except Exception:
+        # 嘗試 pillow-heif（若有安裝）
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+            bio.seek(0)
+            img = Image.open(bio)
+            img.load()
+        except Exception as e:
+            raise ValueError(f"無法解碼圖片: {e}") from e
+    img = img.convert("RGB")
     img.thumbnail(size, Image.LANCZOS)
     canvas = Image.new("RGB", size, (0, 0, 0))
     x = (size[0] - img.width) // 2
@@ -2871,8 +3214,52 @@ def build_xfade_video(image_paths: list[str], output_path: str, seconds_per_phot
         raise RuntimeError(f"ffmpeg 執行失敗: {result.stderr[-2000:]}")
 
 
+def _looks_like_heic(name: str, data: bytes | None = None) -> bool:
+    n = (name or "").lower()
+    if n.endswith((".heic", ".heif", ".hif")):
+        return True
+    if data and len(data) > 12:
+        # ftyp....heic / heif / mif1
+        head = data[4:12].lower()
+        if b"heic" in head or b"heif" in head or b"mif1" in head:
+            return True
+    return False
+
+
+async def download_graph_thumbnail(client: httpx.AsyncClient, token: str, item_id: str, size: str = "large") -> bytes | None:
+    """向 Graph 即時取 JPEG 縮圖（對 HEIC 也適用，最穩）。"""
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = await client.get(
+            f"{GRAPH_BASE}/me/drive/items/{item_id}/thumbnails",
+            headers=headers,
+            timeout=25,
+        )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            return None
+        thumbs = (resp.json().get("value") or [])
+        if not thumbs:
+            return None
+        t = thumbs[0]
+        url = None
+        for s in (size, "large", "medium", "small"):
+            if s in t and t[s].get("url"):
+                url = t[s]["url"]
+                break
+        if not url:
+            return None
+        img_resp = await client.get(url, timeout=30, follow_redirects=True)
+        if img_resp.status_code == 200 and img_resp.content:
+            return img_resp.content
+    except Exception as e:
+        print(f"download_graph_thumbnail failed id={item_id}: {e}")
+    return None
+
+
 async def download_full_image(client: httpx.AsyncClient, token: str, item_id: str) -> bytes | None:
-    """優先用 Graph downloadUrl（預簽章、較穩），失敗再退回 /content。"""
+    """優先用 Graph downloadUrl，失敗再退回 /content。"""
     headers = {"Authorization": f"Bearer {token}"}
     try:
         meta = await client.get(
@@ -2903,23 +3290,67 @@ async def download_full_image(client: httpx.AsyncClient, token: str, item_id: st
     return None
 
 
-async def get_full_image_bytes(client: httpx.AsyncClient, item: dict, token: str | None) -> bytes | None:
-    """原圖 → 大縮圖 URL → 中縮圖 URL，盡量拿到可用的圖。"""
-    if token:
-        raw = await download_full_image(client, token, item["id"])
+async def get_memory_frame_bytes(client: httpx.AsyncClient, item: dict, token: str | None) -> tuple[bytes | None, str]:
+    """
+    回憶影片專用取圖：優先 Graph JPEG 大縮圖（HEIC 也能用），
+    再試快取縮圖 URL，最後才原圖（非 HEIC）。
+    回傳 (bytes, reason) reason 用於除錯：ok / not_found / decode 等。
+    """
+    item_id = item.get("id") or ""
+    name = item.get("name") or ""
+    is_heic = _looks_like_heic(name)
+
+    # 1) 即時 Graph 縮圖（最穩、一定是瀏覽器可解的 JPEG）
+    if token and item_id:
+        raw = await download_graph_thumbnail(client, token, item_id, "large")
         if raw:
-            return raw
+            return raw, "graph_thumb"
+        # 確認是否真的 404
+        try:
+            meta = await client.get(
+                f"{GRAPH_BASE}/me/drive/items/{item_id}?$select=id",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+            if meta.status_code == 404:
+                return None, "not_found"
+        except Exception:
+            pass
+
+    # 2) 資料庫快取的縮圖 URL（可能過期）
     for key in ("thumbnail_large_url", "thumbnailLargeUrl", "thumbnail_url", "thumbnailUrl"):
         url = item.get(key)
-        if not url:
+        if not url or not str(url).startswith("http"):
             continue
         try:
             resp = await client.get(url, timeout=30, follow_redirects=True)
             if resp.status_code == 200 and resp.content:
-                return resp.content
+                return resp.content, "cached_thumb"
         except Exception:
             continue
-    return None
+
+    # 3) 原圖（略過 HEIC，避免 PIL 解不開）
+    if token and item_id and not is_heic:
+        raw = await download_full_image(client, token, item_id)
+        if raw and not _looks_like_heic(name, raw):
+            return raw, "full"
+        if raw is None:
+            # 可能已刪
+            return None, "download_fail"
+
+    # 4) HEIC 再試一次 medium 縮圖
+    if token and item_id:
+        raw = await download_graph_thumbnail(client, token, item_id, "medium")
+        if raw:
+            return raw, "graph_thumb_medium"
+
+    return None, "no_image"
+
+
+async def get_full_image_bytes(client: httpx.AsyncClient, item: dict, token: str | None) -> bytes | None:
+    """相容舊呼叫：走回憶取圖邏輯。"""
+    raw, _ = await get_memory_frame_bytes(client, item, token)
+    return raw
 
 
 async def render_memory_video(job_id: str, items: list[dict], token: str | None, music_path: str | None, title: str, sid: str | None = None):
@@ -2927,23 +3358,28 @@ async def render_memory_video(job_id: str, items: list[dict], token: str | None,
     tmp_dir = os.path.join(RENDER_DIR, job_id)
     os.makedirs(tmp_dir, exist_ok=True)
     purged = []
+    fail_reasons: dict[str, int] = {}
     try:
         if sid:
             fresh = await get_ms_token(sid)
             if fresh:
                 token = fresh
 
+        if not token:
+            raise ValueError("登入已過期，請重新登入後再產生回憶影片。")
+
         frame_paths = []
         failed = 0
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             for idx, item in enumerate(items):
-                raw = await get_full_image_bytes(client, item, token)
+                raw, reason = await get_memory_frame_bytes(client, item, token)
                 if not raw:
                     failed += 1
+                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                     MEMORY_JOBS[job_id]["failed"] = failed
                     MEMORY_JOBS[job_id]["progress"] = idx + 1
-                    # 下載失敗很可能是已刪：清本地 DB
-                    if sid and item.get("id"):
+                    # 只有確認 not_found 才清 DB，避免網路抖動誤刪
+                    if reason == "not_found" and sid and item.get("id"):
                         try:
                             conn = sqlite3.connect(DB_PATH)
                             conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, item["id"]))
@@ -2956,22 +3392,38 @@ async def render_memory_video(job_id: str, items: list[dict], token: str | None,
                     continue
                 try:
                     frame = prepare_frame(raw, (1280, 720))
-                except Exception:
-                    failed += 1
-                    MEMORY_JOBS[job_id]["failed"] = failed
-                    MEMORY_JOBS[job_id]["progress"] = idx + 1
-                    continue
+                except Exception as e:
+                    print(f"prepare_frame fail id={item.get('id')} reason={reason}: {e}")
+                    # 解碼失敗再試 Graph medium 縮圖一次
+                    raw2 = await download_graph_thumbnail(client, token, item["id"], "medium") if token else None
+                    if raw2:
+                        try:
+                            frame = prepare_frame(raw2, (1280, 720))
+                        except Exception as e2:
+                            print(f"prepare_frame retry fail: {e2}")
+                            failed += 1
+                            fail_reasons["decode"] = fail_reasons.get("decode", 0) + 1
+                            MEMORY_JOBS[job_id]["failed"] = failed
+                            MEMORY_JOBS[job_id]["progress"] = idx + 1
+                            continue
+                    else:
+                        failed += 1
+                        fail_reasons["decode"] = fail_reasons.get("decode", 0) + 1
+                        MEMORY_JOBS[job_id]["failed"] = failed
+                        MEMORY_JOBS[job_id]["progress"] = idx + 1
+                        continue
                 frame_path = os.path.join(tmp_dir, f"{idx:03d}.jpg")
                 frame.save(frame_path, "JPEG", quality=90)
                 frame_paths.append(frame_path)
                 MEMORY_JOBS[job_id]["progress"] = idx + 1
+                await asyncio.sleep(0.05)
 
         if len(frame_paths) < 2:
+            reason_txt = "、".join(f"{k}:{v}" for k, v in fail_reasons.items()) or "未知"
             raise ValueError(
-                f"可下載到的照片不足兩張（成功 {len(frame_paths)}、失敗 {failed}"
-                + (f"、已清除失效 {len(purged)} 筆" if purged else "")
-                + "）。可能原因：登入已過期、檔案已從 OneDrive 刪除、或網路被擋。"
-                "請先到「更多 → 清除失效照片」或重新登入後再試。"
+                f"可下載到的照片不足兩張（成功 {len(frame_paths)}、失敗 {failed}；原因 {reason_txt}"
+                + (f"；已清除失效 {len(purged)} 筆" if purged else "")
+                + "）。請重新登入，或到「更多 → 清除失效照片」後再試。"
             )
         output_path = os.path.join(RENDER_DIR, f"{job_id}.mp4")
         await asyncio.to_thread(
