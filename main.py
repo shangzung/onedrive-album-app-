@@ -10,6 +10,7 @@ import asyncio
 import io
 import json
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -2708,60 +2709,185 @@ async def location_view(request: Request, lat: float, lng: float):
 # 回憶影片
 # ---------------------------------------------------------------------------
 def list_music_files() -> list[str]:
-    try: return sorted(f for f in os.listdir(MUSIC_DIR) if f.lower().endswith((".mp3", ".m4a", ".wav")))
-    except FileNotFoundError: return []
+    try:
+        return sorted(f for f in os.listdir(MUSIC_DIR) if f.lower().endswith((".mp3", ".m4a", ".wav")))
+    except FileNotFoundError:
+        return []
+
+
+def _memory_eligible(items: list[dict]) -> list[dict]:
+    """排除截圖、無 id、明顯不適合回憶的項目。"""
+    out = []
+    for it in items:
+        if not it.get("id"):
+            continue
+        if is_screenshot(it):
+            continue
+        mime = (it.get("mime_type") or it.get("mimeType") or "").lower()
+        name = (it.get("name") or "").lower()
+        if mime.startswith("video/"):
+            continue  # 回憶影片目前只拼靜態圖
+        if name.endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm")):
+            continue
+        out.append(it)
+    return out
+
+
+def _pick_random(items: list[dict], n: int = 20) -> list[dict]:
+    """隨機抽樣，最多 n 張；不足則全部打亂回傳。"""
+    if not items:
+        return []
+    if len(items) <= n:
+        result = list(items)
+        random.shuffle(result)
+        return result
+    return random.sample(items, n)
+
 
 def photos_on_this_day(items: list[dict]) -> dict[int, list[dict]]:
-    today = datetime.now(); result: dict[int, list[dict]] = {}
+    today = datetime.now()
+    result: dict[int, list[dict]] = {}
     for it in items:
         dt = parse_taken(it)
-        if dt and dt.month == today.month and dt.day == today.day and dt.year != today.year: result.setdefault(dt.year, []).append(it)
+        if dt and dt.month == today.month and dt.day == today.day and dt.year != today.year:
+            result.setdefault(dt.year, []).append(it)
     return result
+
+
+def photos_this_week_across_years(items: list[dict]) -> list[dict]:
+    """前後 3 天、跨所有年份的「季節感」回憶池。"""
+    today = datetime.now()
+    out = []
+    for it in items:
+        dt = parse_taken(it)
+        if not dt or dt.year == today.year:
+            continue
+        # 用月日近似：允許 ±3 天
+        try:
+            d_this = today.replace(year=dt.year).date()
+        except ValueError:
+            # 2/29 等
+            d_this = today.replace(year=dt.year, day=28).date()
+        delta = abs((dt.date() - d_this).days)
+        if delta <= 3:
+            out.append(it)
+    return out
+
+
+# 主題回憶：依標籤 / 檔名 / 地點啟發式分類（無 AI）
+_THEME_RULES = {
+    "kids": {
+        "title": "小孩的回憶錄",
+        "icon": "👶",
+        "tags": ["小孩", "孩子", "寶寶", "嬰兒", "兒童", "兒子", "女兒", "baby", "kid", "kids", "child"],
+        "name_kw": ["baby", "kid", "child", "小孩", "寶寶", "兒子", "女兒"],
+    },
+    "travel": {
+        "title": "旅遊回憶錄",
+        "icon": "✈️",
+        "tags": ["旅行", "旅遊", "出國", "度假", "travel", "trip", "vacation", "tour"],
+        "name_kw": ["travel", "trip", "tour", "旅行", "旅遊", "出國", "japan", "korea", "tokyo", "osaka", "paris"],
+    },
+    "family": {
+        "title": "家庭回憶錄",
+        "icon": "🏠",
+        "tags": ["家庭", "家人", "家族", "爸媽", "爺奶", "family", "家人聚餐"],
+        "name_kw": ["family", "家庭", "家人", "聚餐", "過年", "團圓"],
+    },
+}
+
+
+def collect_theme_photos(sid: str, items: list[dict], theme_key: str) -> list[dict]:
+    """依標籤 + 檔名關鍵字收集主題照片；家庭另含最愛。"""
+    rule = _THEME_RULES[theme_key]
+    tag_set = set(rule["tags"])
+    name_kw = rule["name_kw"]
+
+    # 有該標籤的 photo_id
+    tagged_ids: set[str] = set()
+    for tag in tag_set:
+        tagged_ids.update(photos_with_tag(sid, tag))
+
+    matched = []
+    for it in items:
+        pid = it.get("id")
+        if not pid:
+            continue
+        name = (it.get("name") or "").lower()
+        if pid in tagged_ids:
+            matched.append(it)
+            continue
+        if any(kw.lower() in name for kw in name_kw):
+            matched.append(it)
+            continue
+        if theme_key == "family" and it.get("favorite"):
+            matched.append(it)
+            continue
+        if theme_key == "travel":
+            # 有 GPS 且不在常見「住家附近」的粗略判斷：只要有座標就當候選之一
+            if it.get("latitude") is not None and it.get("longitude") is not None:
+                matched.append(it)
+    # 去重保序
+    seen = set()
+    uniq = []
+    for it in matched:
+        if it["id"] not in seen:
+            seen.add(it["id"])
+            uniq.append(it)
+    return uniq
+
 
 def prepare_frame(image_bytes: bytes, size: tuple[int, int]) -> Image.Image:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img.thumbnail(size, Image.LANCZOS)
     canvas = Image.new("RGB", size, (0, 0, 0))
-    x = (size[0] - img.width) // 2; y = (size[1] - img.height) // 2
+    x = (size[0] - img.width) // 2
+    y = (size[1] - img.height) // 2
     canvas.paste(img, (x, y))
     return canvas
 
+
 def build_xfade_video(image_paths: list[str], output_path: str, seconds_per_photo: float = 3.0, transition_seconds: float = 1.0, audio_path: str | None = None):
     n = len(image_paths)
-    if n < 2: raise ValueError("至少需要兩張照片才能產生回憶影片")
+    if n < 2:
+        raise ValueError("至少需要兩張照片才能產生回憶影片")
     clip_len = seconds_per_photo + transition_seconds
     cmd = ["ffmpeg", "-y"]
-    for p in image_paths: cmd += ["-loop", "1", "-t", f"{clip_len:.3f}", "-i", p]
-    filter_parts = []; prev_label = "0:v"
+    for p in image_paths:
+        cmd += ["-loop", "1", "-t", f"{clip_len:.3f}", "-i", p]
+    filter_parts = []
+    prev_label = "0:v"
     for i in range(1, n):
         offset = i * seconds_per_photo - (i - 1) * transition_seconds
         out_label = f"v{i}" if i < n - 1 else "vout"
         filter_parts.append(f"[{prev_label}][{i}:v]xfade=transition=fade:duration={transition_seconds:.3f}:offset={offset:.3f}[{out_label}]")
         prev_label = out_label
     cmd += ["-filter_complex", ";".join(filter_parts), "-map", f"[{prev_label}]"]
-    if audio_path: cmd += ["-i", audio_path, "-map", f"{n}:a", "-shortest", "-c:a", "aac"]
+    if audio_path:
+        cmd += ["-i", audio_path, "-map", f"{n}:a", "-shortest", "-c:a", "aac"]
     cmd += ["-r", "25", "-pix_fmt", "yuv420p", output_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0: raise RuntimeError(f"ffmpeg 執行失敗: {result.stderr[-2000:]}")
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg 執行失敗: {result.stderr[-2000:]}")
+
 
 async def download_full_image(client: httpx.AsyncClient, token: str, item_id: str) -> bytes | None:
     """優先用 Graph downloadUrl（預簽章、較穩），失敗再退回 /content。"""
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        # 1) 先取 metadata 裡的 @microsoft.graph.downloadUrl
         meta = await client.get(
             f"{GRAPH_BASE}/me/drive/items/{item_id}?$select=id,@microsoft.graph.downloadUrl",
             headers=headers,
             timeout=20,
         )
+        if meta.status_code == 404:
+            return None
         if meta.status_code == 200:
             download_url = meta.json().get("@microsoft.graph.downloadUrl")
             if download_url:
-                # downloadUrl 本身已帶授權，不要再帶 Bearer
                 resp = await client.get(download_url, timeout=60, follow_redirects=True)
                 if resp.status_code == 200 and resp.content:
                     return resp.content
-        # 2) 退回 /content
         resp = await client.get(
             f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
             headers=headers,
@@ -2770,9 +2896,12 @@ async def download_full_image(client: httpx.AsyncClient, token: str, item_id: st
         )
         if resp.status_code == 200 and resp.content:
             return resp.content
+        if resp.status_code == 404:
+            return None
     except Exception as e:
         print(f"download_full_image failed id={item_id}: {e}")
     return None
+
 
 async def get_full_image_bytes(client: httpx.AsyncClient, item: dict, token: str | None) -> bytes | None:
     """原圖 → 大縮圖 URL → 中縮圖 URL，盡量拿到可用的圖。"""
@@ -2780,7 +2909,6 @@ async def get_full_image_bytes(client: httpx.AsyncClient, item: dict, token: str
         raw = await download_full_image(client, token, item["id"])
         if raw:
             return raw
-    # 縮圖 fallback（回憶影片品質會差一點，但至少能產出）
     for key in ("thumbnail_large_url", "thumbnailLargeUrl", "thumbnail_url", "thumbnailUrl"):
         url = item.get(key)
         if not url:
@@ -2793,12 +2921,13 @@ async def get_full_image_bytes(client: httpx.AsyncClient, item: dict, token: str
             continue
     return None
 
+
 async def render_memory_video(job_id: str, items: list[dict], token: str | None, music_path: str | None, title: str, sid: str | None = None):
     MEMORY_JOBS[job_id] = {"status": "rendering", "progress": 0, "total": len(items), "title": title, "failed": 0}
     tmp_dir = os.path.join(RENDER_DIR, job_id)
     os.makedirs(tmp_dir, exist_ok=True)
+    purged = []
     try:
-        # 背景任務執行較久，中途刷新一次 token
         if sid:
             fresh = await get_ms_token(sid)
             if fresh:
@@ -2813,6 +2942,17 @@ async def render_memory_video(job_id: str, items: list[dict], token: str | None,
                     failed += 1
                     MEMORY_JOBS[job_id]["failed"] = failed
                     MEMORY_JOBS[job_id]["progress"] = idx + 1
+                    # 下載失敗很可能是已刪：清本地 DB
+                    if sid and item.get("id"):
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            conn.execute("DELETE FROM photos WHERE sid = ? AND id = ?", (sid, item["id"]))
+                            conn.execute("DELETE FROM photo_tags WHERE sid = ? AND photo_id = ?", (sid, item["id"]))
+                            conn.commit()
+                            conn.close()
+                            purged.append(item["id"])
+                        except Exception:
+                            pass
                     continue
                 try:
                     frame = prepare_frame(raw, (1280, 720))
@@ -2828,9 +2968,10 @@ async def render_memory_video(job_id: str, items: list[dict], token: str | None,
 
         if len(frame_paths) < 2:
             raise ValueError(
-                f"可下載到的照片不足兩張（成功 {len(frame_paths)}、失敗 {failed}）。"
-                "可能原因：登入已過期、檔案已從 OneDrive 刪除、或網路被擋。"
-                "請重新登入後再試一次。"
+                f"可下載到的照片不足兩張（成功 {len(frame_paths)}、失敗 {failed}"
+                + (f"、已清除失效 {len(purged)} 筆" if purged else "")
+                + "）。可能原因：登入已過期、檔案已從 OneDrive 刪除、或網路被擋。"
+                "請先到「更多 → 清除失效照片」或重新登入後再試。"
             )
         output_path = os.path.join(RENDER_DIR, f"{job_id}.mp4")
         await asyncio.to_thread(
@@ -2843,9 +2984,20 @@ async def render_memory_video(job_id: str, items: list[dict], token: str | None,
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def render_memories_html(items: list[dict]) -> str:
-    today_groups = photos_on_this_day(items); events = [e for e in cluster_events(items) if len(e["items"]) >= 4][:6]; music_files = list_music_files()
-    
+
+def render_memories_html(items: list[dict], sid: str = "") -> str:
+    eligible = _memory_eligible(items)
+    today_groups = photos_on_this_day(eligible)
+    week_pool = photos_this_week_across_years(eligible)
+    events = [e for e in cluster_events(eligible) if len(e["items"]) >= 4][:8]
+    music_files = list_music_files()
+
+    # 主題回憶
+    themes = {}
+    for key in _THEME_RULES:
+        pool = collect_theme_photos(sid, eligible, key) if sid else []
+        themes[key] = pool
+
     def music_select(field_id: str) -> str:
         options_html = "".join(f"<option value='{f}'>{f}</option>" for f in music_files)
         return f"""
@@ -2854,53 +3006,138 @@ def render_memories_html(items: list[dict]) -> str:
             {options_html}
         </select>
         """
-        
-    def render_group(group: list[dict], label: str, title: str, field_id: str) -> str:
-        ids = ",".join(it["id"] for it in group[:20])
-        thumbs = "".join(lb_img_tag(it) for it in group[:8] if it.get("id"))
+
+    def render_group(group: list[dict], label: str, title: str, field_id: str, *, randomize: bool = True, limit: int = 20) -> str:
+        picked = _pick_random(group, limit) if randomize else group[:limit]
+        if len(picked) < 2:
+            return ""
+        ids = ",".join(it["id"] for it in picked if it.get("id"))
+        # 預覽也隨機抽最多 8 張
+        preview = _pick_random(picked, min(8, len(picked)))
+        thumbs = "".join(lb_img_tag(it) for it in preview if it.get("id"))
         return f"""
         <div class="card group-card">
             <div class="group-title">{label}</div>
-            <div class="group-sub">共 {len(group)} 張,最多取前 20 張做影片</div>
+            <div class="group-sub">候選 {len(group)} 張，這次隨機取 {len(picked)} 張做影片（每次重整會不一樣）</div>
             <div class="photo-grid">{thumbs}</div>
             <form class="inline-form" method="post" action="/memories/render">
                 <input type="hidden" name="ids" value="{ids}" />
                 <input type="hidden" name="title" value="{title}" />
                 {music_select(field_id)}
-                <button class="btn-primary" type="submit">產生回憶影片</button>
+                <button class="btn-primary" type="submit">✨ 產生回憶影片</button>
             </form>
         </div>
         """
 
+    # ---- 當年今日（跨年合輯 + 各年份）----
+    today = datetime.now()
+    date_label = f"{today.month} 月 {today.day} 日"
+    all_on_this_day = []
+    for year in sorted(today_groups.keys(), reverse=True):
+        all_on_this_day.extend(today_groups[year])
+
+    if len(all_on_this_day) >= 2:
+        cross_year = render_group(
+            all_on_this_day,
+            f"📅 往年的今天（{date_label}・跨 {len(today_groups)} 個年份）",
+            f"往年的今天 {date_label}",
+            "music-today-all",
+            limit=24,
+        )
+    else:
+        cross_year = """<div class="card"><p class="secondary">目前還沒有足夠的「往年今日」照片（至少需要 2 張）。</p></div>"""
+
     if today_groups:
-        today_section = "".join(render_group(group, f"{year} 年的今天", f"{year} 年的今天", f"music-{year}") for year, group in sorted(today_groups.items(), reverse=True))
+        year_sections = "".join(
+            render_group(group, f"{year} 年的今天", f"{year} 年的今天", f"music-{year}")
+            for year, group in sorted(today_groups.items(), reverse=True)
+            if len(group) >= 2
+        ) or """<div class="card"><p class="secondary">各年份單年張數不足 2 張，請看上方跨年合輯。</p></div>"""
     else:
-        today_section = """<div class="card"><p class="secondary">目前還沒有找到「當年今日」的舊照片。</p></div>"""
-        
+        year_sections = """<div class="card"><p class="secondary">目前還沒有找到「當年今日」的舊照片。</p></div>"""
+
+    # ---- 本週跨年（更隨機、類似 Google 季節回顧）----
+    if len(week_pool) >= 4:
+        week_section = render_group(
+            week_pool,
+            f"🎲 這個季節的回憶（前後 3 天・跨年份・{len(week_pool)} 張候選）",
+            f"{date_label} 前後的回憶",
+            "music-week",
+            limit=20,
+        )
+    else:
+        week_section = ""
+
+    # ---- 主題回憶錄 ----
+    theme_sections = []
+    for key, rule in _THEME_RULES.items():
+        pool = themes.get(key) or []
+        if len(pool) >= 2:
+            theme_sections.append(
+                render_group(
+                    pool,
+                    f"{rule['icon']} {rule['title']}（{len(pool)} 張候選）",
+                    rule["title"],
+                    f"music-theme-{key}",
+                    limit=20,
+                )
+            )
+        else:
+            tag_hint = "、".join(rule["tags"][:4])
+            theme_sections.append(f"""
+            <div class="card">
+                <div class="group-title">{rule['icon']} {rule['title']}</div>
+                <p class="secondary">目前照片不足。可到照片加上標籤（例如「{tag_hint}」），或把關鍵字放進檔名，之後就會自動出現在這裡。</p>
+            </div>
+            """)
+    themes_html = "".join(theme_sections)
+
+    # ---- 事件 ----
     if events:
-        events_section = "".join(render_group(ev["items"], f"{ev['start'].strftime('%Y-%m-%d')} 開始的事件", f"{ev['start'].strftime('%Y-%m-%d')} 的回憶", f"music-ev-{idx}") for idx, ev in enumerate(events))
+        # 隨機挑幾個事件展示，不要永遠同一批
+        show_events = events if len(events) <= 6 else random.sample(events, 6)
+        show_events = sorted(show_events, key=lambda e: e["start"], reverse=True)
+        events_section = "".join(
+            render_group(
+                ev["items"],
+                f"📌 {ev['start'].strftime('%Y-%m-%d')} 開始的事件",
+                f"{ev['start'].strftime('%Y-%m-%d')} 的回憶",
+                f"music-ev-{idx}",
+            )
+            for idx, ev in enumerate(show_events)
+        )
     else:
-        events_section = """<div class="card"><p class="secondary">目前還沒有偵測到照片數量夠多的事件(需要拍攝時間資料)。</p></div>"""
-        
+        events_section = """<div class="card"><p class="secondary">目前還沒有偵測到照片數量夠多的事件（需要拍攝時間資料）。</p></div>"""
+
     music_hint = "" if music_files else """
-    <p class="secondary" style="margin:0 6px 14px;">目前 music/ 資料夾裡沒有音檔,只能產生無配樂的影片;要加配樂的話把你自己的 mp3/m4a/wav 放進專案的 music/ 資料夾。</p>
+    <p class="secondary" style="margin:0 6px 14px;">目前 music/ 資料夾裡沒有音檔，只能產生無配樂的影片；要加配樂把 mp3/m4a/wav 放進專案的 music/ 資料夾。</p>
     """
-    
+
     body = f"""
     {music_hint}
-    <div class="section-title">當年今日</div>
-    {today_section}
+    <p class="secondary" style="margin:0 6px 14px;">
+        每次打開或重新整理，候選照片會<strong>重新隨機</strong>。
+        已從 OneDrive 刪除的照片若仍出現，產生影片時會自動略過並清掉本地紀錄；也可到
+        <a class="pill-link" href="/cleanup/missing">清除失效照片</a>。
+    </p>
+    <div class="section-title">當年今日（類似 Google 相簿）</div>
+    {cross_year}
+    {week_section}
+    <div class="section-title">各年份的今天</div>
+    {year_sections}
+    <div class="section-title">主題回憶錄</div>
+    {themes_html}
     <div class="section-title">自動整理的相片事件</div>
     {events_section}
     """
-    
     return page_shell("回憶影片", body, active_tab="memories")
+
 
 @app.get("/memories", response_class=HTMLResponse)
 async def memories(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(render_memories_html(db_get_photos(sid)))
+    return HTMLResponse(render_memories_html(db_get_photos(sid), sid=sid))
 
 @app.post("/memories/render")
 async def memories_render(request: Request):
