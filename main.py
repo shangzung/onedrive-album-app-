@@ -3130,15 +3130,101 @@ def _memory_eligible(items: list[dict]) -> list[dict]:
     return out
 
 
+def _memory_quality_score(item: dict) -> float:
+    """回憶選圖品質分數（越高越好）。偏愛清晰、最愛、有時間、非截圖。"""
+    score = 10.0
+    if item.get("favorite"):
+        score += 25
+    if is_blurry(item):
+        score -= 40
+    if is_screenshot(item):
+        score -= 50
+    # 有拍攝時間
+    if parse_taken(item):
+        score += 8
+    else:
+        score -= 5
+    # 有尺寸資訊
+    w, h = item.get("width") or 0, item.get("height") or 0
+    if w and h:
+        mp = (w * h) / 1_000_000
+        if mp >= 2:
+            score += 6
+        elif mp < 0.3:
+            score -= 8
+    # 有定位（旅遊感）
+    if item.get("latitude") is not None:
+        score += 4
+    # 檔案太小可能是壞圖
+    size = item.get("size") or 0
+    if size and size < 30_000:
+        score -= 15
+    elif size and size > 200_000:
+        score += 3
+    # 輕微隨機，避免每次完全一樣
+    score += random.uniform(-3, 3)
+    return score
+
+
 def _pick_random(items: list[dict], n: int = 20) -> list[dict]:
-    """隨機抽樣，最多 n 張；不足則全部打亂回傳。"""
+    """依品質加權抽樣：先過濾明顯差的，再依分數排序後分層隨機。"""
     if not items:
         return []
-    if len(items) <= n:
-        result = list(items)
+    # 過濾截圖 / 影片（雙重保險）
+    pool = []
+    for it in items:
+        if not it.get("id"):
+            continue
+        if is_screenshot(it):
+            continue
+        mime = (it.get("mime_type") or it.get("mimeType") or "").lower()
+        name = (it.get("name") or "").lower()
+        if mime.startswith("video/") or name.endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm")):
+            continue
+        if is_blurry(it) and not it.get("favorite"):
+            continue
+        pool.append(it)
+    if not pool:
+        pool = [it for it in items if it.get("id")]
+    if len(pool) <= n:
+        result = list(pool)
         random.shuffle(result)
         return result
-    return random.sample(items, n)
+    # 依分數排序，從前 60% 優質池中抽，再補一點隨機多樣性
+    ranked = sorted(pool, key=_memory_quality_score, reverse=True)
+    top_k = max(n, int(len(ranked) * 0.6))
+    top_pool = ranked[:top_k]
+    if len(top_pool) <= n:
+        return top_pool
+    # 時間分散：按年份分桶再抽
+    buckets: dict[str, list] = defaultdict(list)
+    for it in top_pool:
+        dt = parse_taken(it)
+        key = str(dt.year) if dt else "unknown"
+        buckets[key].append(it)
+    picked = []
+    keys = list(buckets.keys())
+    random.shuffle(keys)
+    # 輪流從各年取，直到滿 n
+    while len(picked) < n and any(buckets.values()):
+        for k in keys:
+            if len(picked) >= n:
+                break
+            if buckets[k]:
+                # 桶內再依分數偏高抽
+                buckets[k].sort(key=_memory_quality_score, reverse=True)
+                # 從前幾名隨機
+                cand = buckets[k][: min(5, len(buckets[k]))]
+                choice = random.choice(cand)
+                buckets[k].remove(choice)
+                if choice not in picked:
+                    picked.append(choice)
+    if len(picked) < n:
+        remain = [it for it in top_pool if it not in picked]
+        random.shuffle(remain)
+        picked.extend(remain[: n - len(picked)])
+    random.shuffle(picked)
+    return picked[:n]
 
 
 def photos_on_this_day(items: list[dict]) -> dict[int, list[dict]]:
@@ -3663,18 +3749,60 @@ async def memories(request: Request):
 @app.post("/memories/render")
 async def memories_render(request: Request):
     sid = request.session.get("sid")
-    if not sid: return RedirectResponse("/login", status_code=303)
+    if not sid:
+        return RedirectResponse("/login", status_code=303)
     token = await get_ms_token(sid, request=request)
-    form = await request.form(); ids = [i for i in str(form.get("ids", "")).split(",") if i]
-    if len(ids) < 2: return JSONResponse({"error": "photos_not_enough"}, status_code=400)
-    all_photos = {p["id"]: p for p in db_get_photos(sid)}; items = [all_photos[i] for i in ids if i in all_photos]
-    if len(items) < 2: return JSONResponse({"error": "photos_not_found"}, status_code=400)
-    music = form.get("music"); music_path = os.path.join(MUSIC_DIR, str(music)) if music else None
-    if music_path and not os.path.isfile(music_path): music_path = None
     if not token:
         return RedirectResponse("/login", status_code=303)
+
+    form = await request.form()
+    raw_ids = str(form.get("ids", "") or "")
+    ids = [i.strip() for i in raw_ids.split(",") if i.strip()]
+    title = str(form.get("title", "回憶影片") or "回憶影片")
+    music = form.get("music")
+    music_path = os.path.join(MUSIC_DIR, str(music)) if music else None
+    if music_path and not os.path.isfile(music_path):
+        music_path = None
+
+    all_list = db_get_photos(sid)
+    all_photos = {p["id"]: p for p in all_list if p.get("id")}
+    items = [all_photos[i] for i in ids if i in all_photos]
+
+    # 表單裡的 id 可能已被清除失效照片刪掉 → 用同標題語意從合格庫補齊
+    if len(items) < 2:
+        eligible = _memory_eligible(all_list)
+        # 若標題像「往年的今天」→ 用跨年今日補
+        if "今天" in title or "今日" in title:
+            refill = []
+            for group in photos_on_this_day(eligible).values():
+                refill.extend(group)
+            if len(refill) < 2:
+                refill = photos_this_week_across_years(eligible)
+            items = _pick_random(refill, 20)
+        elif "小孩" in title or "孩子" in title:
+            items = _pick_random(collect_theme_photos(sid, eligible, "kids"), 20)
+        elif "旅遊" in title or "旅行" in title:
+            items = _pick_random(collect_theme_photos(sid, eligible, "travel"), 20)
+        elif "家庭" in title or "家人" in title:
+            items = _pick_random(collect_theme_photos(sid, eligible, "family"), 20)
+        else:
+            items = _pick_random(eligible, 20)
+
+    if len(items) < 2:
+        body = """
+        <div class="card banner-error">
+            <b>找不到足夠的照片來產生回憶</b>
+            <p class="secondary" style="margin:8px 0 0;">
+              可能這些照片已被清除，或資料庫尚未掃描完成。<br>
+              請回回憶頁重新整理，或先執行「清除失效照片」與增量掃描後再試。
+            </p>
+            <a class="btn-primary" href="/memories">回回憶頁</a>
+            <a class="btn-secondary" href="/cleanup/missing">清除失效照片</a>
+        </div>
+        """
+        return HTMLResponse(page_shell("回憶影片", body, active_tab="memories", back_href="/memories"))
+
     job_id = str(uuid.uuid4())
-    title = str(form.get("title", "回憶影片"))
     MEMORY_JOBS[job_id] = {"status": "pending", "title": title}
     asyncio.create_task(render_memory_video(job_id, items, token, music_path, title, sid=sid))
     return RedirectResponse(f"/memories/status/{job_id}", status_code=303)
