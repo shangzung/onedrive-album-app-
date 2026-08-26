@@ -220,9 +220,9 @@ form.inline-form { margin: 0; }
 }
 .filter-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .select-mode .photo-tile { cursor: pointer; -webkit-user-select: none; user-select: none; }
-.select-mode .photo-tile img { cursor: pointer; pointer-events: none; }
+.select-mode .photo-tile img { cursor: pointer; }
 /* 多選模式隱藏最愛/刪除按鈕，避免手機觸控被攔截 */
-.select-mode .tile-actions { display: none !important; }
+.select-mode .tile-actions { display: none !important; pointer-events: none !important; }
 .select-mode .photo-tile.selected::after {
     content: ''; position: absolute; inset: 0; border: 3px solid var(--accent);
     border-radius: 6px; background: rgba(10,132,255,0.15); pointer-events: none; z-index: 1;
@@ -275,7 +275,7 @@ function initLightbox() {
     lbThumbs = Array.from(document.querySelectorAll('.lb-thumb'));
     lbThumbs.forEach((img, i) => {
         img.addEventListener('click', (e) => {
-            // 多選模式下不開燈箱，讓選取邏輯處理
+            // 多選模式：不開燈箱（選取由 document capture 的 handleSelectOnTile 負責，避免雙重 toggle）
             if (typeof selectMode !== 'undefined' && selectMode) {
                 e.preventDefault();
                 e.stopPropagation();
@@ -293,9 +293,11 @@ function openLightbox(i) {
 }
 function showLightbox() {
     const t = lbThumbs[lbIndex];
+    if (!t) return;
     const isVideo = t.dataset.video === '1';
     const imgEl = document.getElementById('lightbox-img');
     const vidEl = document.getElementById('lightbox-video');
+    const photoId = t.dataset.id || '';
     // 切換時先停掉上一部影片
     try { vidEl.pause(); vidEl.removeAttribute('src'); vidEl.load(); } catch (e) {}
     if (isVideo) {
@@ -303,21 +305,31 @@ function showLightbox() {
         imgEl.removeAttribute('src');
         vidEl.style.display = 'block';
         // 透過後端代理取得可播放網址（帶登入狀態）
-        vidEl.src = '/api/media/' + encodeURIComponent(t.dataset.id || '') + '/stream';
+        vidEl.src = '/api/media/' + encodeURIComponent(photoId) + '/stream';
         vidEl.play().catch(() => {});
     } else {
         vidEl.style.display = 'none';
         imgEl.style.display = 'block';
-        imgEl.src = t.dataset.full || t.src;
+        // 一律走後端代理 large 縮圖，避免 Graph 暫時網址過期 → 黑畫面
+        const proxyLarge = photoId ? ('/api/media/' + encodeURIComponent(photoId) + '/thumb?size=large') : '';
+        imgEl.onerror = function() {
+            this.onerror = null;
+            if (proxyLarge && this.src.indexOf('size=large') !== -1) {
+                this.src = '/api/media/' + encodeURIComponent(photoId) + '/thumb?size=medium';
+            } else if (t.src) {
+                this.src = t.src;
+            }
+        };
+        imgEl.src = proxyLarge || t.dataset.full || t.src || '';
     }
     const kind = isVideo ? '🎬 ' : '';
     document.getElementById('lightbox-caption').textContent = kind + (t.dataset.name || '') + (t.dataset.taken ? '  ・  ' + t.dataset.taken : '');
     const favBtn = document.getElementById('lb-fav-btn');
-    favBtn.dataset.id = t.dataset.id || '';
+    favBtn.dataset.id = photoId;
     const isFav = t.dataset.fav === '1';
     favBtn.innerHTML = isFav ? '&#9733;' : '&#9734;';
     favBtn.classList.toggle('active', isFav);
-    document.getElementById('lb-del-btn').dataset.id = t.dataset.id || '';
+    document.getElementById('lb-del-btn').dataset.id = photoId;
 }
 function navLightbox(delta) { if (lbThumbs.length === 0) return; lbIndex = (lbIndex + delta + lbThumbs.length) % lbThumbs.length; showLightbox(); }
 function closeLightbox() {
@@ -464,9 +476,10 @@ function toggleTileSelection(tile) {{
 
 function handleSelectOnTile(e) {{
     if (!selectMode) return;
-    // 工具列 / 按鈕本身不處理
-    if (e.target.closest('#select-toolbar') || e.target.closest('#enter-select-btn') || e.target.closest('button') || e.target.closest('a') || e.target.closest('form')) return;
-    const tile = e.target.closest('.photo-tile');
+    // 工具列 / 進入按鈕不處理；tabbar / topbar / lightbox 也不處理
+    if (e.target.closest && (e.target.closest('#select-toolbar') || e.target.closest('#enter-select-btn'))) return;
+    if (e.target.closest && (e.target.closest('.tabbar') || e.target.closest('.topbar') || e.target.closest('#lightbox-overlay'))) return;
+    const tile = e.target.closest ? e.target.closest('.photo-tile') : null;
     if (!tile) return;
     e.preventDefault();
     e.stopPropagation();
@@ -567,14 +580,14 @@ async function batchDeleteSelected() {{
 def lb_img_tag(item: dict, badge: str | None = None) -> str:
     item_id = (item.get("id") or "").replace('"', "&quot;")
     stored = item.get("thumbnail_url") or item.get("thumbnailUrl") or ""
-    stored_large = item.get("thumbnail_large_url") or item.get("thumbnailLargeUrl") or stored
-    # 有快取網址就先用（較快）；沒有才走代理，避免 6000 張同時打 Graph
+    # 縮圖列表：有快取網址就先用（較快）；失敗 onerror 改走代理
+    # 燈箱大圖一律走代理（見 showLightbox），避免 Graph 暫時 URL 過期變黑畫面
     if stored and stored.startswith("http"):
         thumb = stored
-        full = stored_large if stored_large.startswith("http") else stored
     else:
         thumb = f"/api/media/{item_id}/thumb" if item_id else ""
-        full = f"/api/media/{item_id}/thumb?size=large" if item_id else ""
+    # data-full 固定為代理 large
+    full = f"/api/media/{item_id}/thumb?size=large" if item_id else ""
     name = (item.get("name") or "").replace('"', "&quot;")
     taken = (item.get("taken_date_time") or item.get("takenDateTime") or "").replace('"', "&quot;")
     is_fav = bool(item.get("favorite"))
@@ -1945,15 +1958,16 @@ async def api_media_thumb(request: Request, item_id: str, size: str = "medium"):
     """
     sid = request.session.get("sid")
     token = await get_ms_token(sid)
+    # 此端點會被 <img> 引用，未登入時不可回傳 HTML redirect（會變成黑圖）
     if not sid or not token:
-        return RedirectResponse("/login", status_code=303)
+        return JSONResponse({"error": "not_logged_in"}, status_code=401)
 
     size = size if size in ("small", "medium", "large") else "medium"
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            # 先取縮圖清單
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            # 先取縮圖清單（Graph 對 HEIC 也會產生 JPEG 縮圖）
             resp = await client.get(
                 f"{GRAPH_BASE}/me/drive/items/{item_id}/thumbnails",
                 headers=headers,
@@ -2119,7 +2133,8 @@ async def api_batch_delete(request: Request, ids: str = Form(...)):
                     f"{GRAPH_BASE}/me/drive/items/{pid}",
                     headers=headers,
                 )
-                if resp.status_code in (204, 200):
+                # 204/200 成功；404 視為已不存在，也算刪除成功
+                if resp.status_code in (204, 200, 404):
                     success_ids.append(pid)
                     try:
                         conn = sqlite3.connect(DB_PATH)
