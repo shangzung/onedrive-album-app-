@@ -670,6 +670,14 @@ def init_db():
             sid TEXT PRIMARY KEY, delta_link TEXT, last_scan_at TEXT, photo_count INTEGER DEFAULT 0
         )
     """)
+    # 持久化 refresh_token，避免 Render 重啟後記憶體清空變成 not_logged_in
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_tokens (
+            sid TEXT PRIMARY KEY,
+            refresh_token TEXT,
+            updated_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -810,29 +818,83 @@ def orientation_of(item: dict) -> str:
 def _msal_app() -> msal.ConfidentialClientApplication:
     return msal.ConfidentialClientApplication(client_id=CLIENT_ID, client_credential=CLIENT_SECRET, authority=AUTHORITY)
 
-def _store_ms_token(sid: str, result: dict):
+def _save_refresh_token_db(sid: str, refresh_token: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO auth_tokens (sid, refresh_token, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(sid) DO UPDATE SET refresh_token=excluded.refresh_token, updated_at=excluded.updated_at",
+            (sid, refresh_token, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"save refresh_token db failed: {e}")
+
+
+def _load_refresh_token_db(sid: str) -> str | None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT refresh_token FROM auth_tokens WHERE sid = ?", (sid,)).fetchone()
+        conn.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _clear_refresh_token_db(sid: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM auth_tokens WHERE sid = ?", (sid,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _store_ms_token(sid: str, result: dict, request=None):
     TOKEN_STORE.setdefault(sid, {})
     TOKEN_STORE[sid]["access_token"] = result["access_token"]
     if result.get("refresh_token"):
         TOKEN_STORE[sid]["refresh_token"] = result["refresh_token"]
+        _save_refresh_token_db(sid, result["refresh_token"])
+        # 同步寫入 session（若有），跨重啟可還原
+        if request is not None:
+            try:
+                request.session["refresh_token"] = result["refresh_token"]
+            except Exception:
+                pass
     expires_in = result.get("expires_in", 3600)
     TOKEN_STORE[sid]["expires_at"] = datetime.utcnow() + timedelta(seconds=int(expires_in) - 120)
 
-async def get_ms_token(sid: str | None) -> str | None:
-    """回傳有效的 OneDrive access_token,過期前 2 分鐘自動用 refresh_token 換新。"""
-    if not sid or sid not in TOKEN_STORE:
+
+async def get_ms_token(sid: str | None, request=None) -> str | None:
+    """回傳有效的 OneDrive access_token；記憶體沒有時從 DB/session 還原 refresh_token。"""
+    if not sid:
         return None
-    entry = TOKEN_STORE[sid]
+
+    entry = TOKEN_STORE.get(sid) or {}
     if entry.get("access_token") and entry.get("expires_at") and datetime.utcnow() < entry["expires_at"]:
         return entry["access_token"]
+
     refresh_token = entry.get("refresh_token")
+    if not refresh_token and request is not None:
+        refresh_token = request.session.get("refresh_token")
     if not refresh_token:
-        return entry.get("access_token")
+        refresh_token = _load_refresh_token_db(sid)
+
+    if not refresh_token:
+        return entry.get("access_token")  # 可能仍有未過期的 access（少見）
+
     result = _msal_app().acquire_token_by_refresh_token(refresh_token, scopes=SCOPES)
     if "access_token" not in result:
         TOKEN_STORE.pop(sid, None)
+        _clear_refresh_token_db(sid)
+        if request is not None:
+            request.session.pop("refresh_token", None)
+        print(f"refresh token failed sid={sid}: {result.get('error_description') or result.get('error')}")
         return None
-    _store_ms_token(sid, result)
+    _store_ms_token(sid, result, request=request)
     return result["access_token"]
 
 # ---------------------------------------------------------------------------
@@ -841,7 +903,7 @@ async def get_ms_token(sid: str | None) -> str | None:
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid) if sid else None
+    token = await get_ms_token(sid, request=request) if sid else None
     onedrive_connected = bool(token)
 
     if not onedrive_connected:
@@ -1014,7 +1076,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     if sid != old_sid:
         TOKEN_STORE.pop(old_sid, None)
 
-    _store_ms_token(sid, result)
+    _store_ms_token(sid, result, request=request)
     # 背景還原，避免 Render 在 callback 逾時變 502
     if len(db_get_photos(sid)) == 0:
         RESTORE_STATUS[sid] = {"status": "running", "ok": False, "count": 0, "message": "還原中…"}
@@ -1035,6 +1097,7 @@ async def logout(request: Request):
     sid = request.session.get("sid")
     if sid:
         TOKEN_STORE.pop(sid, None)
+        _clear_refresh_token_db(sid)
     request.session.clear()
     # 導向 Microsoft 登出，避免瀏覽器 SSO 自動用同一帳號再登入
     post = quote(REDIRECT_URI.replace("/callback", "/") if "/callback" in REDIRECT_URI else "https://onedrive-album-app.onrender.com/", safe="")
@@ -1052,7 +1115,7 @@ async def logout(request: Request):
 async def restore_page(request: Request):
     """手動觸發從 OneDrive 還原備份（背景執行，避免 Render 502）。"""
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token:
         return RedirectResponse("/login", status_code=303)
     if RESTORE_STATUS.get(sid, {}).get("status") == "running":
@@ -1632,7 +1695,7 @@ def start_scan_if_needed(sid: str, token: str, force_full: bool = False):
 @app.get("/scan/start")
 async def scan_start(request: Request, force: int = 0):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not token:
         return JSONResponse({"error": "not_logged_in"}, status_code=401)
     start_scan_if_needed(sid, token, force_full=bool(force))
@@ -1700,7 +1763,7 @@ async def duplicates_view(request: Request, threshold: int = DEFAULT_DUP_THRESHO
 @app.post("/duplicates/auto-clean")
 async def auto_clean_duplicates(request: Request, threshold: int = Form(DEFAULT_DUP_THRESHOLD)):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token: return RedirectResponse("/login", status_code=303)
 
     groups = find_duplicate_groups(db_get_photos(sid), threshold=threshold)
@@ -1847,7 +1910,7 @@ async def cleanup_view(request: Request):
 @app.post("/cleanup/batch-move")
 async def cleanup_batch_move(request: Request, ids: str = Form(...)):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token: return RedirectResponse("/login", status_code=303)
 
     id_list = [i for i in ids.split(",") if i]
@@ -1931,7 +1994,7 @@ async def cleanup_skip(request: Request, ids: str = Form(...)):
 @app.post("/api/photo/delete")
 async def api_delete_photo(request: Request, id: str = Form(...)):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token: return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
 
     conn = sqlite3.connect(DB_PATH)
@@ -1972,7 +2035,7 @@ async def api_media_thumb(request: Request, item_id: str, size: str = "medium"):
     size: small | medium | large
     """
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     # 此端點會被 <img> 引用，未登入時不可回傳 HTML redirect（會變成黑圖）
     if not sid or not token:
         return JSONResponse({"error": "not_logged_in"}, status_code=401)
@@ -2064,7 +2127,7 @@ async def api_media_stream(request: Request, item_id: str):
     影片串流：後端代理 OneDrive 內容，避免瀏覽器直接打 SharePoint 時的 CORS / 轉址問題。
     """
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token:
         return RedirectResponse("/login", status_code=303)
     auth = {"Authorization": f"Bearer {token}"}
@@ -2150,7 +2213,7 @@ async def api_toggle_favorite(request: Request, id: str = Form(...)):
 async def api_batch_delete(request: Request, ids: str = Form(...)):
     """批次刪除照片（移到 OneDrive 回收桶）"""
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token:
         return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
 
@@ -2204,7 +2267,7 @@ async def api_purge_missing(request: Request, limit: int = 200):
     用來清掉灰格 / 404 縮圖。
     """
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token:
         return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
 
@@ -2279,8 +2342,14 @@ async def cleanup_missing_page(request: Request):
         btn.textContent = '檢查中……';
         el.textContent = '';
         try {
-            const resp = await fetch('/api/photos/purge-missing', { method: 'POST' });
+            const resp = await fetch('/api/photos/purge-missing', { method: 'POST', credentials: 'same-origin' });
             const data = await resp.json();
+            if (resp.status === 401 || data.error === 'not_logged_in') {
+                el.innerHTML = '登入已過期（Render 重啟後需重新登入）。<a class="pill-link" href="/login">點此重新登入</a>';
+                btn.disabled = false;
+                btn.textContent = '清除失效照片';
+                return;
+            }
             if (data.success) {
                 el.textContent = '已檢查 ' + data.checked + ' 筆，清除 ' + data.purged + ' 筆失效紀錄。請回圖庫重新整理。';
             } else {
@@ -2825,7 +2894,7 @@ async def smart_classify_page(request: Request):
 @app.post("/smart-classify/start")
 async def smart_classify_start(request: Request, use_ai: str = Form("0")):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token:
         return RedirectResponse("/login", status_code=303)
     job = CLASSIFY_JOBS.get(sid) or {}
@@ -3595,7 +3664,7 @@ async def memories(request: Request):
 async def memories_render(request: Request):
     sid = request.session.get("sid")
     if not sid: return RedirectResponse("/login", status_code=303)
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     form = await request.form(); ids = [i for i in str(form.get("ids", "")).split(",") if i]
     if len(ids) < 2: return JSONResponse({"error": "photos_not_enough"}, status_code=400)
     all_photos = {p["id"]: p for p in db_get_photos(sid)}; items = [all_photos[i] for i in ids if i in all_photos]
@@ -3779,7 +3848,7 @@ def render_gallery_html(items: list[dict], status: dict, visible_months: int, ye
 @app.get("/gallery", response_class=HTMLResponse)
 async def gallery(request: Request, months: int = GALLERY_MONTHS_PER_PAGE, year: str | None = None):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token: return RedirectResponse("/login", status_code=303)
     status = SCAN_STATUS.get(sid, {"status": "idle", "count": 0})
     return HTMLResponse(render_gallery_html(db_get_photos(sid), status, max(1, months), year_filter=year))
@@ -3886,7 +3955,7 @@ async def search_page(request: Request, q: str = "", year: str = "", month: str 
 @app.get("/photos")
 async def photos(request: Request, max_depth: int = 6):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not token: return JSONResponse({"error": "not_logged_in", "hint": "先前往 /login"}, status_code=401)
     try: return {"count": len(items := await fetch_all_media(token, max_depth=max_depth)), "items": items}
     except httpx.HTTPStatusError as e: return JSONResponse({"error": "graph_api_error", "detail": e.response.text}, status_code=e.response.status_code)
@@ -4047,7 +4116,7 @@ async def reviews_page(request: Request, period: str = "week"):
 @app.post("/download/zip")
 async def download_zip(request: Request, ids: str = Form(...)):
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token:
         return RedirectResponse("/login", status_code=303)
     id_list = [i for i in ids.split(",") if i][:80]  # 上限保護
@@ -4090,7 +4159,7 @@ async def download_zip(request: Request, ids: str = Form(...)):
 async def api_create_share(request: Request, id: str = Form(...), scope: str = Form("anonymous")):
     """為單一照片或資料夾建立分享連結。scope: anonymous | organization"""
     sid = request.session.get("sid")
-    token = await get_ms_token(sid)
+    token = await get_ms_token(sid, request=request)
     if not sid or not token:
         return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
 
