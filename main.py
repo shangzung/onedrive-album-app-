@@ -276,7 +276,7 @@ function initLightbox() {
     lbThumbs.forEach((img, i) => {
         img.addEventListener('click', (e) => {
             // 多選模式：不開燈箱（選取由 document capture 的 handleSelectOnTile 負責，避免雙重 toggle）
-            if (typeof selectMode !== 'undefined' && selectMode) {
+            if (window.selectMode) {
                 e.preventDefault();
                 e.stopPropagation();
                 return;
@@ -286,7 +286,7 @@ function initLightbox() {
     });
 }
 function openLightbox(i) {
-    if (typeof selectMode !== 'undefined' && selectMode) return;
+    if (window.selectMode) return;
     lbIndex = i;
     showLightbox();
     document.getElementById('lightbox-overlay').classList.add('active');
@@ -432,117 +432,111 @@ def page_shell(
     </div>
     {LIGHTBOX_ASSETS if include_lightbox else ""}
 <script>
-/* ========== 多選 + 批次刪除（手機友善） ========== */
-let selectMode = false;
-let selectedIds = new Set();
-// 避免 touch 後又觸發 click 造成「選了又取消」
-let _selectTouchHandled = false;
-let _selectTouchTimer = null;
+/* ========== 多選 + 批次刪除（直接綁定 tile，手機/桌面都穩） ========== */
+window.selectMode = false;
+window.selectedIds = new Set();
 
 function toggleSelectMode() {{
-    selectMode = !selectMode;
-    selectedIds.clear();
-    document.body.classList.toggle('select-mode', selectMode);
+    window.selectMode = !window.selectMode;
+    window.selectedIds.clear();
+    document.body.classList.toggle('select-mode', window.selectMode);
     const toolbar = document.getElementById('select-toolbar');
     const enterBtn = document.getElementById('enter-select-btn');
-    if (toolbar) toolbar.style.display = selectMode ? 'flex' : 'none';
-    if (enterBtn) enterBtn.style.display = selectMode ? 'none' : 'inline-block';
+    if (toolbar) toolbar.style.display = window.selectMode ? 'flex' : 'none';
+    if (enterBtn) enterBtn.style.display = window.selectMode ? 'none' : 'inline-block';
     document.querySelectorAll('.photo-tile.selected').forEach(el => el.classList.remove('selected'));
     updateSelectedCount();
-    // 進入多選時關掉燈箱，避免狀態混亂
-    if (selectMode) {{
+    // 進入多選：直接在每張 tile 上綁定點擊；離開時移除
+    bindTileSelectHandlers(window.selectMode);
+    if (window.selectMode) {{
         try {{ closeLightbox(); }} catch (e) {{}}
     }}
 }}
 
 function updateSelectedCount() {{
     const el = document.getElementById('selected-count');
-    if (el) el.textContent = '已選 ' + selectedIds.size + ' 張';
+    if (el) el.textContent = '已選 ' + window.selectedIds.size + ' 張';
 }}
 
 function toggleTileSelection(tile) {{
     if (!tile) return;
     const id = tile.dataset.id;
     if (!id) return;
-    if (selectedIds.has(id)) {{
-        selectedIds.delete(id);
+    if (window.selectedIds.has(id)) {{
+        window.selectedIds.delete(id);
         tile.classList.remove('selected');
     }} else {{
-        selectedIds.add(id);
+        window.selectedIds.add(id);
         tile.classList.add('selected');
     }}
     updateSelectedCount();
 }}
 
-function handleSelectOnTile(e) {{
-    if (!selectMode) return;
-    // 工具列 / 進入按鈕不處理；tabbar / topbar / lightbox 也不處理
-    if (e.target.closest && (e.target.closest('#select-toolbar') || e.target.closest('#enter-select-btn'))) return;
-    if (e.target.closest && (e.target.closest('.tabbar') || e.target.closest('.topbar') || e.target.closest('#lightbox-overlay'))) return;
-    const tile = e.target.closest ? e.target.closest('.photo-tile') : null;
-    if (!tile) return;
+function onTileSelectClick(e) {{
+    if (!window.selectMode) return;
     e.preventDefault();
     e.stopPropagation();
-    if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    const tile = e.currentTarget;
     toggleTileSelection(tile);
 }}
 
-// 記錄 touchstart，用來區分「點一下」與「滑動捲頁」
-let _touchStartX = 0, _touchStartY = 0, _touchStartTile = null;
-document.addEventListener('touchstart', function(e) {{
-    if (!selectMode) return;
-    const t = e.touches && e.touches[0];
-    if (!t) return;
-    _touchStartX = t.clientX;
-    _touchStartY = t.clientY;
-    _touchStartTile = (e.target.closest && e.target.closest('.photo-tile')) || null;
-}}, {{ capture: true, passive: true }});
-
-// 手機：優先用 touchend（比 click 更即時、較少被 lightbox 搶走）
-document.addEventListener('touchend', function(e) {{
-    if (!selectMode) return;
-    const tile = e.target.closest && e.target.closest('.photo-tile');
-    if (!tile || tile !== _touchStartTile) {{
-        _touchStartTile = null;
-        return;
+function onTileSelectTouch(e) {{
+    if (!window.selectMode) return;
+    // 忽略滑動（由 touchstart 座標判斷）
+    const t = e.changedTouches && e.changedTouches[0];
+    if (t && tileTouchStart) {{
+        const dx = Math.abs(t.clientX - tileTouchStart.x);
+        const dy = Math.abs(t.clientY - tileTouchStart.y);
+        if (dx > 12 || dy > 12) return;
     }}
-    const t = (e.changedTouches && e.changedTouches[0]) || null;
-    if (t) {{
-        const dx = Math.abs(t.clientX - _touchStartX);
-        const dy = Math.abs(t.clientY - _touchStartY);
-        // 移動超過約 12px 視為捲動，不選取
-        if (dx > 12 || dy > 12) {{
-            _touchStartTile = null;
-            return;
-        }}
-    }}
-    _touchStartTile = null;
-    _selectTouchHandled = true;
-    if (_selectTouchTimer) clearTimeout(_selectTouchTimer);
-    _selectTouchTimer = setTimeout(function() {{ _selectTouchHandled = false; }}, 450);
-    handleSelectOnTile(e);
-}}, {{ capture: true, passive: false }});
+    e.preventDefault();
+    e.stopPropagation();
+    const tile = e.currentTarget;
+    toggleTileSelection(tile);
+    // 標記已處理，避免後續 click 再 toggle 一次
+    tile._selectJustTouched = true;
+    setTimeout(function() {{ tile._selectJustTouched = false; }}, 400);
+}}
 
-// 桌面 / 部分瀏覽器 fallback：click（若剛處理過 touch 則略過，避免雙重切換）
-document.addEventListener('click', function(e) {{
-    if (!selectMode) return;
-    if (_selectTouchHandled) {{
+var tileTouchStart = null;
+
+function onTileSelectClickGuard(e) {{
+    if (e.currentTarget && e.currentTarget._selectJustTouched) {{
         e.preventDefault();
         e.stopPropagation();
         return;
     }}
-    handleSelectOnTile(e);
-}}, true);
+    onTileSelectClick(e);
+}}
+
+function bindTileSelectHandlers(enable) {{
+    document.querySelectorAll('.photo-tile').forEach(function(tile) {{
+        tile.removeEventListener('click', onTileSelectClickGuard, true);
+        tile.removeEventListener('touchend', onTileSelectTouch, true);
+        tile.removeEventListener('touchstart', onTileTouchStart, true);
+        if (enable) {{
+            tile.addEventListener('click', onTileSelectClickGuard, true);
+            tile.addEventListener('touchstart', onTileTouchStart, {{ capture: true, passive: true }});
+            tile.addEventListener('touchend', onTileSelectTouch, {{ capture: true, passive: false }});
+        }}
+    }});
+}}
+
+function onTileTouchStart(e) {{
+    const t = e.touches && e.touches[0];
+    if (t) tileTouchStart = {{ x: t.clientX, y: t.clientY }};
+}}
 
 async function batchDeleteSelected() {{
-    if (selectedIds.size === 0) {{
+    if (window.selectedIds.size === 0) {{
         alert('請先選擇要刪除的照片');
         return;
     }}
-    if (!confirm('確定要刪除這 ' + selectedIds.size + ' 張照片嗎？\n\n照片會移到 OneDrive 回收桶，之後還可以還原。')) {{
+    if (!confirm('確定要刪除這 ' + window.selectedIds.size + ' 張照片嗎？\n\n照片會移到 OneDrive 回收桶，之後還可以還原。')) {{
         return;
     }}
-    const ids = Array.from(selectedIds).join(',');
+    const ids = Array.from(window.selectedIds).join(',');
     const btn = document.querySelector('#select-toolbar .btn-primary');
     if (btn) {{ btn.disabled = true; btn.textContent = '刪除中...'; }}
     try {{
@@ -595,7 +589,7 @@ def lb_img_tag(item: dict, badge: str | None = None) -> str:
     is_video = mime.startswith("video/") or name.lower().endswith((".mov", ".mp4", ".m4v", ".avi", ".mkv", ".webm"))
     badge_html = f'<div class="photo-badge">{badge}</div>' if badge else ""
     video_badge = '<div class="video-badge">▶</div>' if is_video else ""
-    # 加上 onerror 自動改走代理
+    # 加上 onerror：快取 URL 失效 → 走代理
     onerr = f"this.onerror=null;this.src='/api/media/{item_id}/thumb';" if item_id else ""
     return f"""
     <div class="photo-tile" data-id="{item_id}">
